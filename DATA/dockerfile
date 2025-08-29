@@ -65,4 +65,6 @@ ENV NCCL_ASYNC_ERROR_HANDLING=1 NCCL_LAUNCH_MODE=GROUP
 # ---- Hugging Face / Transformers 캐시 경로 ----------------------------
 ENV HF_HOME=/data/data_team/cache/huggingface \
 TRANSFORMERS_CACHE=/data/data_team/cache/huggingface/transformers \
-HF_DATASETS_CACHE=/data/data_team/cache/huggingface/datasets
+HF_DATASETS_CACHE=/data/data_team/cache/huggingface/datasets \
+RAY_TMPDIR=/data/ray_tmp \
+RAY_VERBOSE=1

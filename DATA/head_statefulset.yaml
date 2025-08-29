@@ -81,11 +81,13 @@ spec:
           command: ["/bin/bash", "-lc"]
           args:
             - |
+              export RAY_TMPDIR=/data/ray_tmp
               ray start --head \
                 --node-ip-address=${MY_POD_IP} \
                 --port=6379 \
                 --dashboard-host=0.0.0.0 \
                 --num-gpus=0 \
+                --temp-dir=/data/ray_tmp \
                 --block
 
           ports:

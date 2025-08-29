@@ -106,9 +106,11 @@ spec:
         command: ["/bin/bash", "-lc"]
         args:
         - |
+          export RAY_TMPDIR=/data/ray_tmp 
           ray start \
             --address=${RAY_ADDRESS} \
             --node-ip-address=${MY_POD_IP} \
+            --temp-dir=/data/ray_tmp \
             --block
 
         # hostNetwork 해제했으므로 컨테이너 포트 노출 불필요
