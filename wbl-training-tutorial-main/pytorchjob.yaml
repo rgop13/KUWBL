@@ -1,0 +1,76 @@
+# pytorchjob.yaml
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: train-ncai-daewook      # 변경 필요 >> {train|test}-소속-id 으로 수정 필요 / 실행중인 파드와 중복이 되면 안됩니다.
+  namespace: p-ncai-wbl         # 프로젝트에 해당되는 Kubernetes Namespace 명
+spec:
+  elasticPolicy:
+    rdzvId: mnist
+    rdzvBackend: c10d
+    minReplicas: 2
+    maxReplicas: 2
+    nProcPerNode: 8
+  runPolicy:
+    cleanPodPolicy: None
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 2               # 변경 필요 >> 학습에 사용할 총 노드 수 (하나의 노드에는 GPU 8개가 할당됩니다. 사용하고자 하는 GPU / 8개 단위로 설정 필요)
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"  # Istio sidecar injection 비활성화는 필수
+        spec:
+          nodeSelector:
+            mlx.navercorp.com/zone: h100-i001v8 # GPU Resources 에서 확인 가능한 Zone 명 
+          imagePullSecrets:
+            - name: ncai-wbl-registry-secret # 프로젝트에 해당되는 Image Pull Secret 명
+          containers:
+          - name: pytorch  # PyTorchJob의 container 이름은 반드시 pytorch로 설정
+            image: ncai-wbl-registry.kr.ncr.ntruss.com/fashion-mnist:1.9 # 변경 필요 >> 본인이 푸시한 최종 도커 이미지 경로 수정 버전
+            imagePullPolicy: Always
+            securityContext:  # Infiniband 를 사용하기 위한 securityContext가 필요합니다.
+              capabilities:
+                add: ["IPC_LOCK"]
+            command: ["bash", "-c"]
+            args: # 변경 필요 >> mnist_distributed.py 에서 argument로 지정 가능한 항목들입니다. (checkpoint_path, log_path, data_path)
+            - >
+              mkdir -p /tmp/checkpoints /tmp/logs &&
+              torchrun --nnodes ${PET_NNODES} --nproc_per_node ${PET_NPROC_PER_NODE} --rdzv_id ${PET_RDZV_ID} --rdzv_backend ${PET_RDZV_BACKEND} --rdzv_endpoint ${PET_RDZV_ENDPOINT}
+              /opt/mnist/src/mnist_distributed.py --checkpoint_path /mnt/output/checkpoint/mnist.pt --log_path /mnt/output/log --data_path /mnt/data/backup/test/fashion_mnist/fashion_mnist_arrow
+            # 주의 할 점: 65라인에서 subPath를 지정하여 나만의 폴더가 이미 마운트 되었기 때문에 /mnt/output 이후에 내 id가 없어야 합니다.
+            env:
+            - name: NCCL_DEBUG
+              value: INFO
+            resources:
+              limits:
+                memory: "1Ti"
+                cpu: 32
+                nvidia.com/gpu: 8
+                rdma/hca_shared_devices_a: 1
+              requests:
+                memory: "8Gi"
+                cpu: 8
+                nvidia.com/gpu: 8
+                rdma/hca_shared_devices_a: 1
+            # shared memory
+            volumeMounts:
+            - mountPath: /dev/shm
+              name: shared-memory
+            - mountPath: "/mnt/data"  # 학습 데이터 마운트 경로
+              name: training-data
+              readOnly: true
+            - mountPath: "/mnt/output"  # 결과물 저장을 위한 마운트 경로
+              name: training-output
+              subPath: daewook         # 변경 필요 >> pvc-admin 에서 생성한 output 볼륨의 서브 디렉토리 명
+          volumes:
+          - name: shared-memory
+            emptyDir:
+              medium: Memory
+          - name: training-data
+            persistentVolumeClaim:
+              claimName: training-data
+          - name: training-output
+            persistentVolumeClaim:
+              claimName: training-output

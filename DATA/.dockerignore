@@ -1,0 +1,5 @@
+.git
+.vscode
+pvc.yaml
+__pycache__/
+dockerfile

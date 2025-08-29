@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-ku-workers
+  namespace: p-ncai-wbl
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ray-ku-worker
+  template:
+    metadata:
+      labels:
+        app: ray-ku-worker
+        ray-cluster: ray-ku
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      # === hostNetwork 우회 ===
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # =======================
+      terminationGracePeriodSeconds: 120
+
+      # PVC가 root 소유여도 쓰게끔 (이미지가 UID/GID 500이라면 권장)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 500
+        runAsGroup: 500
+        fsGroup: 500
+        fsGroupChangePolicy: "OnRootMismatch"
+
+      nodeSelector:
+        mlx.navercorp.com/zone: h100-i001v8
+
+      # 같은 노드에 워커가 동시에 스케줄되지 않도록 (hostNetwork+고정포트 충돌 방지)
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["ray-ku-worker"]
+            topologyKey: "kubernetes.io/hostname"
+
+      # (보조) 균등 분배 유도
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: ray-ku-worker
+
+      volumes:
+      - name: nlpai-data
+        persistentVolumeClaim:
+          claimName: nlpai-storage
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+      containers:
+      - name: ray-ku-worker
+        image: sjysjy/ray_serving:0.4
+        imagePullPolicy: IfNotPresent
+
+        env:
+        - name: MY_POD_IP
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }
+        - name: RAY_ADDRESS
+          value: "ray-ku-head.p-ncai-wbl.svc.cluster.local:6379"
+
+        # --- NCCL/Gloo 5분 패치 ---
+        - { name: NCCL_SOCKET_IFNAME, value: "eth0" }
+        - { name: GLOO_SOCKET_IFNAME,  value: "eth0" }
+        - { name: NCCL_IB_DISABLE,     value: "1" }
+        - { name: NCCL_DEBUG,          value: "INFO" }
+        - { name: NCCL_DEBUG_SUBSYS,   value: "INIT,NET" }
+        - { name: TORCH_NCCL_BLOCKING_WAIT, value: "1" }
+        - { name: NCCL_ASYNC_ERROR_HANDLING, value: "1" }
+        - { name: GLOO_USE_IPV6,       value: "0" }
+        - { name: GLOO_USE_LIBUV,      value: "0" }
+        - { name: VLLM_USE_V1,         value: "1" }
+
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          ray start \
+            --address=${RAY_ADDRESS} \
+            --node-ip-address=${MY_POD_IP} \
+            --object-manager-port=8076 \
+            --node-manager-port=10002 \
+            --runtime-env-agent-port=10003 \
+            --min-worker-port=11000 --max-worker-port=11999 \
+            --block
+
+        # (가독성) 고정 포트 노출
+        ports:
+        - { containerPort: 8076,  name: obj-mgr }
+        - { containerPort: 10002, name: node-mgr }
+        - { containerPort: 10003, name: runtime-env }
+
+        volumeMounts:
+        - { name: nlpai-data, mountPath: /data }
+        - { name: dshm,      mountPath: /dev/shm }
+
+        # 준비/기동 프로브
+        readinessProbe:
+          exec:
+            command: ["/bin/bash", "-lc", "ray status --address=${RAY_ADDRESS} >/dev/null 2>&1"]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        startupProbe:
+          exec:
+            command: ["/bin/bash", "-lc", "ray status --address=${RAY_ADDRESS} >/dev/null 2>&1"]
+          failureThreshold: 30
+          periodSeconds: 10
+
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/bash", "-lc", "ray stop || true"]
+
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+            cpu: 16
+            memory: 512Gi
+          requests:
+            nvidia.com/gpu: 8
+            cpu: 16
+            memory: 512Gi

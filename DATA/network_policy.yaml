@@ -1,0 +1,40 @@
+# (1) ray 파드 상호 통신 + DNS egress 허용
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all-ray-in-namespace
+  namespace: p-ncai-wbl
+spec:
+  podSelector:
+    matchLabels:
+      ray-cluster: ray-ku
+  policyTypes: ["Ingress","Egress"]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          ray-cluster: ray-ku
+  egress:
+  # ray 파드끼리 통신 유지
+  - to:
+    - podSelector:
+        matchLabels:
+          ray-cluster: ray-ku
+  # DNS(coredns) 허용: TCP/UDP 53 (kube-system 네임스페이스의 kube-dns)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - { protocol: UDP, port: 53 }
+    - { protocol: TCP, port: 53 }
+  # (선택) 외부 인터넷으로 나가야 하면 80/443 열기
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - { protocol: TCP, port: 80 }
+    - { protocol: TCP, port: 443 }

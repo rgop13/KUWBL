@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ray-ku-head
+  namespace: p-ncai-wbl
+spec:
+  serviceName: ray-ku-head
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ray-ku-head
+  template:
+    metadata:
+      labels:
+        app: ray-ku-head
+        ray-cluster: ray-ku          # ← 헤드/워커 공통 라벨 권장
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      # === hostNetwork 우회 ===
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # =======================
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        mlx.navercorp.com/zone: h100-i001v8
+      volumes:
+      - name: nlpai-data
+        persistentVolumeClaim:
+          claimName: nlpai-storage
+      - name: dshm                    # ← /dev/shm 확장용
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      containers:
+      - name: ray-ku-head
+        image: sjysjy/ray_serving:0.4
+        imagePullPolicy: IfNotPresent
+        env:
+        # Pod IP를 Ray에 넘겨 멀티 NIC/IPv6 혼선 방지
+        - name: MY_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+
+        # --- NCCL/Gloo 5분 패치 ---
+        - name: NCCL_SOCKET_IFNAME
+          value: "eth0"
+        - name: GLOO_SOCKET_IFNAME
+          value: "eth0"
+        - name: NCCL_IB_DISABLE
+          value: "1"
+        - name: NCCL_DEBUG
+          value: "INFO"
+        - name: NCCL_DEBUG_SUBSYS
+          value: "INIT,NET"
+        - name: TORCH_NCCL_BLOCKING_WAIT
+          value: "1"
+        - name: NCCL_ASYNC_ERROR_HANDLING
+          value: "1"
+        - name: GLOO_USE_IPV6
+          value: "0"
+        - name: GLOO_USE_LIBUV
+          value: "0"
+        # vLLM v1 엔진 강제(혼선 방지; 헤드에서 vLLM 구동 시 유용)
+        - name: VLLM_USE_V1
+          value: "1"
+
+        # Ray Head 실행: 포트 고정 + block
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          ray start --head \
+            --node-ip-address=${MY_POD_IP} \
+            --port=6379 \
+            --dashboard-host=0.0.0.0 \
+            --dashboard-port=8265 \
+            --dashboard-agent-listen-port=8266 \
+            --ray-client-server-port=10001 \
+            --object-manager-port=8076 \
+            --node-manager-port=10002 \
+            --runtime-env-agent-port=10003 \
+            --min-worker-port=11000 --max-worker-port=11999 \
+            --block
+
+        ports:
+        - { containerPort: 6379,  name: gcs }
+        - { containerPort: 8265,  name: dashboard }
+        - { containerPort: 8266,  name: dashboard-agent }
+        - { containerPort: 10001, name: client }
+        - { containerPort: 8000,  name: serve }
+        - { containerPort: 8076,  name: obj-mgr }          # 고정 추가
+        - { containerPort: 10002, name: node-mgr }         # 고정 추가
+        - { containerPort: 10003, name: runtime-env }      # 고정 추가
+
+        volumeMounts:
+        - name: nlpai-data
+          mountPath: /data
+        - name: dshm
+          mountPath: /dev/shm      # ← 공유메모리 확장
+
+        readinessProbe:
+          httpGet:
+            path: /api/cluster_status
+            port: 8265
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+        # 종료 시 그레이스풀 스톱
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/bash", "-lc", "ray stop || true"]
+
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+            cpu: 16
+            memory: 512Gi
+          requests:
+            nvidia.com/gpu: 8
+            cpu: 16
+            memory: 512Gi

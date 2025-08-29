@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: nlpai-storage
+    namespace: p-ncai-wbl # 프로젝트에 해당되는 Kubernetes Namespace 명
+spec:
+    storageClassName: private-h100-ib-ddn-exa	 # 고성능스토리지 StorageClass 명
+    accessModes:
+        - ReadWriteMany
+    resources:
+        requests:
+            storage: 100000Gi # 생성할 고성능 스토리지 용량
