@@ -4,7 +4,7 @@ metadata:
   name: ray-ku-junyoung-workers
   namespace: p-ncai-wbl
 spec:
-  replicas: 5
+  replicas: 6
   selector:
     matchLabels:
       app: ray-ku-junyoung-worker
@@ -20,6 +20,11 @@ spec:
       terminationGracePeriodSeconds: 120
 
       securityContext:
+        # sysctls:
+        #   - name: net.ipv6.conf.all.disable_ipv6
+        #     value: "1"
+        #   - name: net.ipv6.conf.default.disable_ipv6
+        #     value: "1"
         runAsNonRoot: true
         runAsUser: 500
         runAsGroup: 500
@@ -59,7 +64,7 @@ spec:
 
       containers:
       - name: ray-ku-junyoung-worker
-        image: sjysjy/ray_serving:0.8
+        image: sjysjy/ray_serving:0.93
         imagePullPolicy: IfNotPresent
 
         env:
@@ -76,9 +81,20 @@ spec:
         - { name: NCCL_DEBUG_SUBSYS,   value: "INIT,NET" }
         - { name: TORCH_NCCL_BLOCKING_WAIT, value: "1" }
         - { name: NCCL_ASYNC_ERROR_HANDLING, value: "1" }
+        - { name: NCCL_SOCKET_FAMILY,   value: "AF_INET" }
         - { name: GLOO_USE_IPV6,       value: "0" }
+        - { name: TP_USE_IPV6,       value: "0" }
         - { name: GLOO_USE_LIBUV,      value: "0" }
         - { name: VLLM_USE_V1,         value: "1" }
+        # ---- HF 캐시: 모든 런타임이 PVC 캐시 사용 ----
+        - { name: HF_HOME,                value: "/data/data_team/cache/huggingface" }
+        - { name: HF_HUB_CACHE,                value: "/data/data_team/cache/huggingface" }
+        - { name: TRANSFORMERS_CACHE,     value: "/data/data_team/cache/huggingface/transformers" }
+        - { name: HF_DATASETS_CACHE,      value: "/data/data_team/cache/huggingface/datasets" }
+        - { name: VLLM_DOWNLOAD_DIR, value: "/data/data_team/cache/huggingface" }
+        - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+        # - { name: HF_HUB_OFFLINE, value: "1" }
+        # - { name: TRANSFORMERS_OFFLINE, value: "1" }
 
         command: ["/bin/bash", "-lc"]
         args:
@@ -89,7 +105,6 @@ spec:
             --block
 
         # hostNetwork 해제했으므로 컨테이너 포트 노출 불필요
-
         volumeMounts:
         - { name: nlpai-data, mountPath: /data }
         - { name: dshm,      mountPath: /dev/shm }
@@ -97,15 +112,20 @@ spec:
         # 워커가 헤드에 붙는지 확인
         readinessProbe:
           exec:
-            command: ["/bin/bash", "-lc", "ray status --address=${RAY_ADDRESS} >/dev/null 2>&1"]
-          initialDelaySeconds: 10
-          periodSeconds: 10
-          timeoutSeconds: 5
+            command: ["bash","-lc","ray status --address=${RAY_ADDRESS} >/dev/null 2>&1 || exit 1"]
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 15
+          failureThreshold: 6
+
         startupProbe:
           exec:
-            command: ["/bin/bash", "-lc", "ray status --address=${RAY_ADDRESS} >/dev/null 2>&1"]
-          failureThreshold: 30
-          periodSeconds: 10
+            command: ["bash","-lc","ray status --address=${RAY_ADDRESS} >/dev/null 2>&1 || exit 1"]
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 15
+          failureThreshold: 60
+
 
         lifecycle:
           preStop:

@@ -17,100 +17,110 @@ spec:
       annotations:
         sidecar.istio.io/inject: "false"
     spec:
-      initContainers:
-      - name: download-deepseek
-        image: sjysjy/ray_serving:0.8
-        imagePullPolicy: IfNotPresent
-        env:
-        - { name: HF_HOME, value: "/data/cache/huggingface" }
-        - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
-        # 토큰이 필요하면 Secret에서:
-        # - name: HUGGING_FACE_HUB_TOKEN
-        #   valueFrom:
-        #     secretKeyRef: { name: hf-token, key: token }
-        command: ["/bin/bash","-lc"]
-        args:
-        - |
-          python3 /opt/WBL/DATA/serving/download_deepseek.py || exit 1
-        volumeMounts:
-        - { name: nlpai-data, mountPath: /data }
-      # hostNetwork 해제 (기본 CNI 사용)
       terminationGracePeriodSeconds: 120
       nodeSelector:
         mlx.navercorp.com/zone: h100-i001v8
+
+      # IPv6 비활성화(클러스터에서 unsafe sysctls 허용 필요)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 500
+        runAsGroup: 500
+        fsGroup: 500
+        fsGroupChangePolicy: "OnRootMismatch"
+        # sysctls:
+        #   - name: net.ipv6.conf.all.disable_ipv6
+        #     value: "1"
+        #   - name: net.ipv6.conf.default.disable_ipv6
+        #     value: "1"
+
       volumes:
-      - name: nlpai-data
-        persistentVolumeClaim:
-          claimName: nlpai-storage
-      - name: dshm
-        emptyDir:
-          medium: Memory
-          sizeLimit: 16Gi
+        - name: nlpai-data
+          persistentVolumeClaim:
+            claimName: nlpai-storage
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
       containers:
-      - name: ray-ku-junyoung-head
-        image: sjysjy/ray_serving:0.8
-        imagePullPolicy: IfNotPresent
-        env:
-        - name: MY_POD_IP
-          valueFrom: { fieldRef: { fieldPath: status.podIP } }
-        # --- 통신 관련 ---
-        - { name: NCCL_SOCKET_IFNAME, value: "eth0" }
-        - { name: GLOO_SOCKET_IFNAME,  value: "eth0" }
-        # - { name: NCCL_IB_DISABLE,     value: "1" }   # IB 미구성이면 켜는 걸 권장
-        - { name: NCCL_DEBUG,          value: "INFO" }
-        - { name: NCCL_DEBUG_SUBSYS,   value: "INIT,NET" }
-        - { name: TORCH_NCCL_BLOCKING_WAIT, value: "1" }
-        - { name: NCCL_ASYNC_ERROR_HANDLING, value: "1" }
-        - { name: GLOO_USE_IPV6,       value: "0" }
-        - { name: GLOO_USE_LIBUV,      value: "0" }
-        - { name: VLLM_USE_V1,         value: "1" }
+        - name: ray-ku-junyoung-head
+          image: sjysjy/ray_serving:0.93
+          imagePullPolicy: IfNotPresent
 
-        command: ["/bin/bash", "-lc"]
-        args:
-        - |
-          ray start --head \
-            --node-ip-address=${MY_POD_IP} \
-            --port=6379 \
-            --dashboard-host=0.0.0.0 \
-            --block
+          env:
+            - name: MY_POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
 
-        # 굳이 고정/명시가 필요 없는 내부 포트는 노출하지 않음
-        ports:
-        - { containerPort: 6379,  name: gcs }
-        - { containerPort: 8265,  name: dashboard }
-        - { containerPort: 10001, name: client }
+            # --- 통신 관련 ---
+            - { name: NCCL_SOCKET_IFNAME, value: "eth0" }
+            - { name: GLOO_SOCKET_IFNAME,  value: "eth0" }
+            - { name: NCCL_DEBUG,          value: "INFO" }
+            - { name: NCCL_DEBUG_SUBSYS,   value: "INIT,NET" }
+            - { name: NCCL_SOCKET_FAMILY,  value: "AF_INET" }
+            - { name: TORCH_NCCL_BLOCKING_WAIT, value: "1" }
+            - { name: NCCL_ASYNC_ERROR_HANDLING, value: "1" }
+            - { name: GLOO_USE_IPV6,       value: "0" }
+            - { name: TP_USE_IPV6,         value: "0" }
+            - { name: GLOO_USE_LIBUV,      value: "0" }
+            - { name: VLLM_USE_V1,         value: "1" }
 
-        volumeMounts:
-        - { name: nlpai-data, mountPath: /data }
-        - { name: dshm,      mountPath: /dev/shm }
+            # ---- HF 캐시(오프라인/공용 PVC) ----
+            - { name: HF_HOME,                value: "/data/data_team/cache/huggingface" }
+            - { name: HF_HUB_CACHE,                value: "/data/data_team/cache/huggingface" }
+            - { name: TRANSFORMERS_CACHE,     value: "/data/data_team/cache/huggingface/transformers" }
+            - { name: HF_DATASETS_CACHE,      value: "/data/data_team/cache/huggingface/datasets" }
+            - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+            # - { name: HF_HUB_OFFLINE,         value: "1" }
+            # - { name: TRANSFORMERS_OFFLINE,   value: "1" }
+            - { name: VLLM_DOWNLOAD_DIR,      value: "/data/data_team/cache/huggingface" }
 
-        readinessProbe:
-          exec:
-            command: ["/bin/bash", "-lc", "ray status --address=${RAY_ADDRESS} >/dev/null 2>&1 || exit 1"]
-          initialDelaySeconds: 30
-          periodSeconds: 15
-          timeoutSeconds: 15
-          failureThreshold: 6
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              ray start --head \
+                --node-ip-address=${MY_POD_IP} \
+                --port=6379 \
+                --dashboard-host=0.0.0.0 \
+                --num-gpus=0 \
+                --block
 
-        startupProbe:
-          exec:
-            command: ["/bin/bash", "-lc", "ray status --address=${RAY_ADDRESS} >/dev/null 2>&1 || exit 1"]
-          initialDelaySeconds: 30
-          periodSeconds: 20
-          timeoutSeconds: 15
-          failureThreshold: 60
+          ports:
+            - { containerPort: 6379,  name: gcs }
+            - { containerPort: 8265,  name: dashboard }
+            - { containerPort: 10001, name: client }
 
-        lifecycle:
-          preStop:
-            exec:
-              command: ["/bin/bash", "-lc", "ray stop || true"]
+          volumeMounts:
+            - { name: nlpai-data, mountPath: /data }
+            - { name: dshm,      mountPath: /dev/shm }
 
-        resources:
-          limits:
-            nvidia.com/gpu: 8
-            cpu: 16
-            memory: 512Gi
-          requests:
-            nvidia.com/gpu: 8
-            cpu: 16
-            memory: 512Gi
+          readinessProbe:
+            httpGet:
+              path: /api/cluster_status
+              port: 8265
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+
+          startupProbe:
+            httpGet:
+              path: /api/cluster_status
+              port: 8265
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 60
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/bash", "-lc", "ray stop || true"]
+
+          resources:
+            limits:
+              cpu: 16
+              memory: 512Gi
+            requests:
+              cpu: 16
+              memory: 512Gi

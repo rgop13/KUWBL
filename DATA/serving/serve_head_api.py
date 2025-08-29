@@ -1,6 +1,7 @@
 # ray head 에서 실행해야 함
-import asyncio
+import os
 import argparse
+from pathlib import Path
 from typing import List, Any, Tuple
 
 from tqdm.asyncio import tqdm as tqdm_asyncio
@@ -38,12 +39,17 @@ class VLLMRayHeadServer:
                  pipeline_parallel_size: int = 1,
                  gpu_memory_utilization: float = 0.95,
                  **kwargs):
+        # Local snapshot 강제
+        revision = self.get_deepseek_snapshot_revision()
         vllm_engine_args = {
             "tensor_parallel_size": tensor_parallel_size,
             "pipeline_parallel_size": pipeline_parallel_size,
             "gpu_memory_utilization": gpu_memory_utilization,
             "max_model_len": max_model_len,
             "reasoning_parser": "deepseek_r1",
+            "download_dir": "/data/data_team/cache/huggingface",
+            "revision": revision,
+            "tokenizer_revision": revision,
             **kwargs,
         }
         # if "qwen3" in model_name.lower():
@@ -70,6 +76,24 @@ class VLLMRayHeadServer:
                     "fsspec"
                 ],
                 "env_vars": {
+                    # HF 캐시
+                    "HF_HOME": "/data/data_team/cache/huggingface",
+                    "HF_HUB_CACHE": "/data/data_team/cache/huggingface",
+                    "TRANSFORMERS_CACHE": "/data/data_team/cache/huggingface/transformers",
+                    "HF_DATASETS_CACHE": "/data/data_team/cache/huggingface/datasets",
+                    "VLLM_DOWNLOAD_DIR": "/data/data_team/cache/huggingface",
+                    "HF_HUB_ENABLE_HF_TRANSFER": "1",
+                    # 통신 관련
+                    "NCCL_SOCKET_IFNAME": "eth0",
+                    "GLOO_SOCKET_IFNAME": "eth0",
+                    "NCCL_SOCKET_FAMILY": "AF_INET",
+                    "NCCL_DEBUG": "INFO",
+                    "NCCL_DEBUG_SUBSYS": "INIT,NET",
+                    "TORCH_NCCL_BLOCKING_WAIT": "1",
+                    "NCCL_ASYNC_ERROR_HANDLING": "1",
+                    "GLOO_USE_LIBUV": "0",
+                    "GLOO_USE_IPV6": "0",
+                    "TP_USE_IPV6": "0",
                     "VLLM_USE_V1": "1",
                     "TF_ENABLE_ONEDNN_OPTS": "0",
                     "NUMEXPR_MAX_THREADS": "64",
@@ -83,6 +107,13 @@ class VLLMRayHeadServer:
             {"llm_configs": [v3_config]}
         )
         serve.run(llm_app)
+        
+    def get_deepseek_snapshot_revision(self) -> str:
+        HF_HOME = os.environ.get("HF_HOME", "/data/data_team/cache/huggingface")
+        repo_cache = Path(HF_HOME) / "models--deepseek-ai--DeepSeek-V3.1"
+        with open(repo_cache / "refs" / "main", "r") as f:
+            REVISION = f.read().strip()
+        return REVISION
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
