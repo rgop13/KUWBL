@@ -46,7 +46,6 @@ class VLLMRayHeadServer:
             "pipeline_parallel_size": pipeline_parallel_size,
             "gpu_memory_utilization": gpu_memory_utilization,
             "max_model_len": max_model_len,
-            "reasoning_parser": "deepseek_r1",
             "download_dir": "/data/data_team/cache/huggingface",
             "revision": revision,
             "tokenizer_revision": revision,
@@ -97,6 +96,8 @@ class VLLMRayHeadServer:
                     "VLLM_USE_V1": "1",
                     "TF_ENABLE_ONEDNN_OPTS": "0",
                     "NUMEXPR_MAX_THREADS": "64",
+                    "RAY_TMPDIR": "/data/ray_tmp",
+                    "RAY_VERBOSE": "1",
                 }
             },
             accelerator_type="H100",

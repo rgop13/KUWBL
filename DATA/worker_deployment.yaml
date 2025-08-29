@@ -4,7 +4,7 @@ metadata:
   name: ray-ku-junyoung-workers
   namespace: p-ncai-wbl
 spec:
-  replicas: 6
+  replicas: 2
   selector:
     matchLabels:
       app: ray-ku-junyoung-worker
@@ -60,18 +60,21 @@ spec:
       - name: dshm
         emptyDir:
           medium: Memory
-          sizeLimit: 16Gi
+          sizeLimit: 128Gi
 
       containers:
       - name: ray-ku-junyoung-worker
-        image: sjysjy/ray_serving:0.93
+        image: sjysjy/ray_serving:0.94
         imagePullPolicy: IfNotPresent
 
         env:
         - name: MY_POD_IP
           valueFrom: { fieldRef: { fieldPath: status.podIP } }
         - name: RAY_ADDRESS
-          value: "ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:6379"
+          value: "ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:6379"
+        - name: RAY_object_spilling_config
+          value: |
+            {"type": "filesystem", "params":{"directory_path": "/data/ray_spill"}, "buffer_size": "8Gi"}
 
         # NCCL/Gloo 네트워킹 설정(IPv4 고정)
         - { name: NCCL_SOCKET_IFNAME, value: "eth0" }
@@ -93,6 +96,10 @@ spec:
         - { name: HF_DATASETS_CACHE,      value: "/data/data_team/cache/huggingface/datasets" }
         - { name: VLLM_DOWNLOAD_DIR, value: "/data/data_team/cache/huggingface" }
         - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+        - { name: RAY_BACKEND_LOG_LEVEL, value: "debug" }
+        - { name: RAY_TMPDIR,      value: "/data/ray_tmp" }
+        - { name: RAY_VERBOSE, value: "1" }
+
         # - { name: HF_HUB_OFFLINE, value: "1" }
         # - { name: TRANSFORMERS_OFFLINE, value: "1" }
 
