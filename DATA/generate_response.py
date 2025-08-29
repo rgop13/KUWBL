@@ -128,17 +128,17 @@ if __name__ == "__main__":
     # 클러스터 내부 기본값: 헤드 서비스의 Serve 포트(8000)
     SERVE_HOST = os.getenv(
         "RAY_SERVE_HOST",
-        "ray-ku-head.p-ncai-wbl.svc.cluster.local:8000"
+        "127.0.0.1:8000"
     )
 
     generator = AsyncGenerator(
         model_name="deepseek-ai/DeepSeek-V3.1",   # 서버에 등록된 모델명과 정확히 일치
-        host=f"http://{SERVE_HOST}",              # ← Ray Serve 주소로!
+        host=f"http://127.0.0.1:8000",              # ← Ray Serve 주소로!
         timeout_s=120.0,
         max_retries=5,                            # ← 재시도는 여기서 설정됨
     )
     asyncio.run(generator.run(
         query_path="/data/dedup_dataset/if_merged_datasets_30108.jsonl",
         output_path="/data/dedup_generated/if_merged_datasets_30108_generated.jsonl",
-        max_concurrent=100,
+        max_concurrent=40,
     ))

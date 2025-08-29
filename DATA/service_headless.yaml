@@ -1,42 +1,31 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: ray-ku-head
+  name: ray-ku-junyoung-head
   namespace: p-ncai-wbl
   labels:
-    ray-cluster: ray-ku            # 헤드/워커 공통 라벨
+    app: ray-ku-junyoung-head
+    ray-cluster: ray-ku-junyoung     # ← 헤드/워커와 동일하게 맞춤
   annotations:
     sidecar.istio.io/inject: "false"
 spec:
-  clusterIP: None                  # Headless
-  publishNotReadyAddresses: true   # Ready 이전에도 DNS 엔드포인트 노출
-  ipFamilyPolicy: SingleStack     # ← 추가: 서비스를 IPv4 싱글스택으로 고정
-  ipFamilies: [ IPv4 ]            # ← 추가: 서비스를 IPv4 싱글스택으로 고정
+  clusterIP: None                    # Headless (StatefulSet의 serviceName과 짝)
+  publishNotReadyAddresses: true
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [ IPv4 ]
   selector:
-    app: ray-ku-head
-    ray-cluster: ray-ku
+    app: ray-ku-junyoung-head        # ← STS template.labels와 동일
+    ray-cluster: ray-ku-junyoung
   ports:
   - name: gcs
     port: 6379
     targetPort: 6379
-  - name: dashboard
+  - name: dashboard                  # 포트포워딩/모니터링 용도
     port: 8265
     targetPort: 8265
-  - name: dashboard-agent
-    port: 8266
-    targetPort: 8266
-  - name: client
+  - name: client                     # (옵션) ray client
     port: 10001
     targetPort: 10001
-  - name: serve
+  - name: serve                      # (옵션) Ray Serve HTTP
     port: 8000
     targetPort: 8000
-  - name: obj-mgr               # --object-manager-port=8076
-    port: 8076
-    targetPort: 8076
-  - name: node-mgr              # --node-manager-port=10002
-    port: 10002
-    targetPort: 10002
-  - name: runtime-env           # --runtime-env-agent-port=10003
-    port: 10003
-    targetPort: 10003

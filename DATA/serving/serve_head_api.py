@@ -62,6 +62,13 @@ class VLLMRayHeadServer:
                 }
             },
             runtime_env={
+                "pip": [
+                    "pyarrow==21.0.0",
+                    "pandas==2.3.2",
+                    "lz4",
+                    "jsonlines",
+                    "fsspec"
+                ],
                 "env_vars": {
                     "VLLM_USE_V1": "1",
                     "TF_ENABLE_ONEDNN_OPTS": "0",
@@ -85,7 +92,7 @@ if __name__ == "__main__":
     parser.add_argument("--pipeline_parallel_size", type=int, default=2)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.92)
     parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--max_num_seqs", type=int, default=100)
+    parser.add_argument("--max_num_seqs", type=int, default=64)
     args = parser.parse_args()
     generator = VLLMRayHeadServer(
         model_name=args.model_name,

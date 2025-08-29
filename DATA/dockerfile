@@ -12,15 +12,38 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# (OS 패키지 설치 이후, pip 업그레이드 이전 정도 위치에 추가)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends locales \
+ && echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen \
+ && echo "ko_KR.UTF-8 UTF-8" >> /etc/locale.gen \
+ && locale-gen \
+ && update-locale LANG=ko_KR.UTF-8 LC_ALL=ko_KR.UTF-8
+
+# 터미널/파이썬/less가 UTF-8 쓰도록
+ENV LANG=ko_KR.UTF-8 \
+    LC_ALL=ko_KR.UTF-8 \
+    LANGUAGE=ko_KR:ko \
+    PYTHONUTF8=1 \
+    LESSCHARSET=utf-8 \
+    TERM=xterm-256color
+
 # pip 업그레이드
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # 기본 editor를 vim으로 설정(실패해도 빌드 진행)
 RUN update-alternatives --set editor /usr/bin/vim.basic || true
 
-RUN pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 && pip install --no-cache-dir flash-attn --no-build-isolation
-RUN pip install --no-cache-dir xformers flashinfer-python ray[serve-grpc,client] openai huggingface-hub
-RUN pip install --no-cache-dir transformers && pip install --no-cache-dir pydantic==2.11.7 && pip install --no-cache-dir gymnasium dm-tree && pip install --no-cache-dir vllm && pip install --no-cache-dir flash-attn --no-build-isolation && pip install --no-cache-dir pyarrow pandas lz4
+RUN printf '%s\n' \
+  'set encoding=utf-8' \
+  'set fileencodings=utf-8,cp949,euc-kr,latin1' \
+  'set termencoding=utf-8' \
+  'set helplang=ko' \
+  'set fileformats=unix,dos' \
+  > /etc/vim/vimrc.local
+
+RUN pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 && pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation
+RUN pip install --no-cache-dir xformers==0.0.31 flashinfer-python==0.2.14.post1 ray[serve-grpc,client] openai==1.102.0 huggingface-hub==0.34.4
+RUN pip install --no-cache-dir transformers==4.55.4 && pip install --no-cache-dir pydantic==2.11.7 && pip install --no-cache-dir gymnasium dm-tree && pip install --no-cache-dir vllm==0.10.1.1 && pip install --no-cache-dir pyarrow==21.0.0 pandas==2.3.2 lz4 jsonlines fsspec
 RUN mkdir -p /opt/WBL/DATA/serving
 
 WORKDIR /opt/WBL/DATA/serving
@@ -32,13 +55,15 @@ RUN groupadd -g 500 app || true && \
     chmod 0440 /etc/sudoers.d/90-app
 # 고성능 스토리지 사용을 위해서는 UID 500, GID 500 권한 필요
 USER 500:500 
+COPY generate_response.py /opt/WBL/DATA/generate_response.py
 COPY serving/serve_head_api.py /opt/WBL/DATA/serving/serve_head_api.py
+COPY serving/download_deepseek.py /opt/WBL/DATA/serving/download_deepseek.py
 
 # ---- (옵션) NCCL 안정화 -----------------------------------------------
 ENV NCCL_ASYNC_ERROR_HANDLING=1 NCCL_LAUNCH_MODE=GROUP
 
 # ---- Hugging Face / Transformers 캐시 경로 ----------------------------
-ENV HF_HOME=/opt/cache/huggingface \
-TRANSFORMERS_CACHE=/opt/cache/huggingface/transformers \
-HF_DATASETS_CACHE=/opt/cache/huggingface/datasets
-RUN sudo mkdir -p /opt/cache/huggingface /opt/cache/huggingface/transformers /opt/cache/huggingface/datasets && sudo chown -R 500:500 /opt/cache
+ENV HF_HOME=/data/cache/huggingface \
+TRANSFORMERS_CACHE=/data/cache/huggingface/transformers \
+HF_DATASETS_CACHE=/data/cache/huggingface/datasets
+RUN sudo mkdir -p /data/cache/huggingface /data/cache/huggingface/transformers /data/cache/huggingface/datasets && sudo chown -R 500:500 /data/cache
