@@ -9,6 +9,7 @@ spec:
   selector:
     matchLabels:
       app: ray-ku-junyoung-head
+      ray-cluster: ray-ku-junyoung
   template:
     metadata:
       labels:
@@ -45,7 +46,7 @@ spec:
 
       containers:
         - name: ray-ku-junyoung-head
-          image: sjysjy/ray_serving:0.94
+          image: sjysjy/ray_serving:0.990
           imagePullPolicy: IfNotPresent
 
           env:
@@ -75,30 +76,31 @@ spec:
             # - { name: HF_HUB_OFFLINE,         value: "1" }
             # - { name: TRANSFORMERS_OFFLINE,   value: "1" }
             - { name: VLLM_DOWNLOAD_DIR,      value: "/data/data_team/cache/huggingface" }
-            - { name: RAY_TMPDIR,      value: "/data/ray_tmp" }
+            # - { name: RAY_TMPDIR,      value: "/data/ray_tmp" }
             - { name: RAY_VERBOSE, value: "1" }
+            - { name: RAY_NAMESPACE, value: "serve" }
+            - { name: RAY_CLIENT_RECONNECT_GRACE_PERIOD_S, value: "600" }
+            - { name: RAY_CLIENT_SERVER_KEEPALIVE_TIMEOUT_S, value: "120" }
 
+          volumeMounts:
+            - { name: nlpai-data, mountPath: /data }
+            - { name: dshm,      mountPath: /dev/shm }
+          
           command: ["/bin/bash", "-lc"]
           args:
             - |
-              export RAY_TMPDIR=/data/ray_tmp
               ray start --head \
                 --node-ip-address=${MY_POD_IP} \
                 --port=6379 \
                 --dashboard-host=0.0.0.0 \
                 --num-gpus=0 \
-                --temp-dir=/data/ray_tmp \
                 --block
 
           ports:
             - { containerPort: 6379,  name: gcs }
             - { containerPort: 8265,  name: dashboard }
             - { containerPort: 10001, name: client }
-
-          volumeMounts:
-            - { name: nlpai-data, mountPath: /data }
-            - { name: dshm,      mountPath: /dev/shm }
-
+          
           readinessProbe:
             httpGet:
               path: /api/cluster_status

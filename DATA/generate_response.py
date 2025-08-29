@@ -119,7 +119,7 @@ class AsyncGenerator:
                     original_queries[begin + j] = record
 
                 writer.write_all(original_queries[begin:end])
-                self.log(f"Generated {end - begin}/{len(queries)} queries")
+                self.log(f"Generated {end}/{len(queries)} queries")
 
 if __name__ == "__main__":
     import glob

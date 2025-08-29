@@ -1,5 +1,6 @@
 # ray head 에서 실행해야 함
 import os
+import ray
 import argparse
 from pathlib import Path
 from typing import List, Any, Tuple
@@ -12,6 +13,14 @@ from ray.serve.llm import (
     build_openai_app,
     ModelLoadingConfig,
 )
+
+if not ray.is_initialized():
+    ray.init(
+        address="auto",
+        namespace="serve",
+        ignore_reinit_error=True,
+        log_to_driver=True,
+    )
 
 import re
 # ① 정상 쌍 (<think> … </think>)
@@ -30,7 +39,7 @@ def strip_think(text: str) -> str:
     text = re.sub(THINK_OPEN_TILL_BLANK, "", text)
     return text.lstrip()
 
-
+        
 class VLLMRayHeadServer:
     def __init__(self,
                  model_name: str,
@@ -96,8 +105,6 @@ class VLLMRayHeadServer:
                     "VLLM_USE_V1": "1",
                     "TF_ENABLE_ONEDNN_OPTS": "0",
                     "NUMEXPR_MAX_THREADS": "64",
-                    "RAY_TMPDIR": "/data/ray_tmp",
-                    "RAY_VERBOSE": "1",
                 }
             },
             accelerator_type="H100",
@@ -126,6 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--max_num_seqs", type=int, default=64)
     args = parser.parse_args()
+    
     generator = VLLMRayHeadServer(
         model_name=args.model_name,
         max_model_len=args.max_model_len,
