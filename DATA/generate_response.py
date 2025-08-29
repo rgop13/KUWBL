@@ -16,9 +16,6 @@ class AsyncGenerator:
         # HTTP/1.1 keep-alive를 위한 httpx 클라이언트 (동시성/지속연결 튜닝)
         http_client = AsyncClient(limits=Limits(max_connections=100, max_keepalive_connections=20))
 
-        # ⚠️ 재시도는 여기!
-        # - max_retries: OpenAI 클라이언트의 HTTP 자동 재시도 횟수 (408/429/5xx 등에서 동작)
-        # - timeout: 요청 타임아웃 (연결/읽기/전체)
         self.client = AsyncOpenAI(
             base_url=base_url,
             api_key=os.getenv("OPENAI_API_KEY", "EMPTY"),  # Ray/vLLM는 보통 "EMPTY" 허용
@@ -67,7 +64,7 @@ class AsyncGenerator:
             max_tokens=max_tokens,
             # extra_headers={"x-request-id": request_id},  # 필요시 추적용 헤더
         )
-        return out.choices[0].message.content or ""
+        return out.choices[0].message.reasoning_content or ""
 
     async def generate_batch(self,
                              prompts: List[Tuple[str, str]],
@@ -125,20 +122,22 @@ class AsyncGenerator:
                 self.log(f"Generated {end - begin}/{len(queries)} queries")
 
 if __name__ == "__main__":
+    import glob
     # 클러스터 내부 기본값: 헤드 서비스의 Serve 포트(8000)
     SERVE_HOST = os.getenv(
         "RAY_SERVE_HOST",
         "127.0.0.1:8000"
     )
-
     generator = AsyncGenerator(
         model_name="deepseek-ai/DeepSeek-V3.1",   # 서버에 등록된 모델명과 정확히 일치
         host=f"http://127.0.0.1:8000",              # ← Ray Serve 주소로!
         timeout_s=120.0,
         max_retries=5,                            # ← 재시도는 여기서 설정됨
     )
-    asyncio.run(generator.run(
-        query_path="/data/dedup_dataset/if_merged_datasets_30108.jsonl",
-        output_path="/data/dedup_generated/if_merged_datasets_30108_generated.jsonl",
-        max_concurrent=40,
-    ))
+    jsonl_files = glob.glob("/data/datasets/dedup_dataset/*.jsonl")
+    for jsonl_file in jsonl_files:
+        asyncio.run(generator.run(
+            query_path=jsonl_file,
+            output_path=jsonl_file.replace(".jsonl", "_generated.jsonl").replace("dedup_dataset", "dedup_generated"),
+            max_concurrent=24,
+        ))
