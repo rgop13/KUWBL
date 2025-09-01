@@ -46,14 +46,19 @@ class VLLMRayHeadServer:
                  max_model_len: int,
                  tensor_parallel_size: int = 4,
                  pipeline_parallel_size: int = 1,
-                 gpu_memory_utilization: float = 0.95,
+                 gpu_memory_utilization: float = 0.92,
+                 serving_port: int = 8000,
+                 num_replicas: int = 1,
+                 max_num_seqs: int = 96,
                  **kwargs):
-        # Local snapshot 강제
+        # DeepSeek-V3.1 fp16, 16K length 기준 max_num_seqs = 96
+        max_num_seqs = max_num_seqs * num_replicas
         revision = self.get_deepseek_snapshot_revision()
         vllm_engine_args = {
             "tensor_parallel_size": tensor_parallel_size,
             "pipeline_parallel_size": pipeline_parallel_size,
             "gpu_memory_utilization": gpu_memory_utilization,
+            "max_num_seqs": max_num_seqs,
             "max_model_len": max_model_len,
             "download_dir": "/data/data_team/cache/huggingface",
             "revision": revision,
@@ -71,8 +76,11 @@ class VLLMRayHeadServer:
             ),
             deployment_config={
                 "autoscaling_config": {
-                    "min_replicas": 1,
-                    "max_replicas": 1,  # Data Parallelism임 -> 처리 속도 관점
+                    "min_replicas": num_replicas,
+                    "max_replicas": num_replicas,  # Data Parallelism임 -> 처리 속도 관점
+                    "ray_actor_options": {
+                        "num_gpus": tensor_parallel_size * pipeline_parallel_size,
+                    }
                 }
             },
             runtime_env={
@@ -114,6 +122,12 @@ class VLLMRayHeadServer:
         llm_app = build_openai_app(
             {"llm_configs": [v3_config]}
         )
+        serve.start(
+            http_options={
+                "host": "0.0.0.0",
+                "port": serving_port,
+            }
+        )
         serve.run(llm_app)
         
     def get_deepseek_snapshot_revision(self) -> str:
@@ -128,10 +142,12 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="deepseek-ai/DeepSeek-V3.1")
     parser.add_argument("--max_model_len", type=int, default=16384)
     parser.add_argument("--tensor_parallel_size", type=int, default=8)
+    parser.add_argument("--num_replicas", type=int, default=1)
+    parser.add_argument("--serving_port", type=int, default=8000)
     parser.add_argument("--pipeline_parallel_size", type=int, default=2)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.92)
     parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--max_num_seqs", type=int, default=64)
+    parser.add_argument("--max_num_seqs", type=int, default=120)
     args = parser.parse_args()
     
     generator = VLLMRayHeadServer(
@@ -140,7 +156,9 @@ if __name__ == "__main__":
         tensor_parallel_size=args.tensor_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        num_replicas=args.num_replicas,
         max_num_seqs=args.max_num_seqs,
+        serving_port=args.serving_port,
         dtype=args.dtype,
         trust_remote_code=True,
         enable_expert_parallel=True,

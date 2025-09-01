@@ -46,7 +46,7 @@ spec:
 
       containers:
         - name: ray-ku-junyoung-head
-          image: sjysjy/ray_serving:0.990
+          image: sjysjy/ray_serving:0.994
           imagePullPolicy: IfNotPresent
 
           env:
@@ -85,6 +85,10 @@ spec:
           volumeMounts:
             - { name: nlpai-data, mountPath: /data }
             - { name: dshm,      mountPath: /dev/shm }
+
+          securityContext:  # Infiniband 를 사용하기 위함
+            capabilities:
+              add: ["IPC_LOCK"]
           
           command: ["/bin/bash", "-lc"]
           args:

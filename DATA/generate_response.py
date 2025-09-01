@@ -43,7 +43,8 @@ class AsyncGenerator:
     def log(self, message: str):
         self.logger.info(message)
 
-    def load_queries(self, query_path: str) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]]]:
+    @staticmethod
+    def load_queries(query_path: str) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]]]:
         queries, original_queries = [], []
         with jsonlines.open(query_path) as reader:
             for line in reader:
@@ -62,9 +63,10 @@ class AsyncGenerator:
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=max_tokens,
+            extra_body={"chat_template_kwargs": {"thinking": True}},    # Guided from vLLM DeepSeek-V3.1 Guide (https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-V3_1.html#introduction)
             # extra_headers={"x-request-id": request_id},  # 필요시 추적용 헤더
         )
-        return out.choices[0].message.reasoning_content or ""
+        return out.choices[0].message.content or ""
 
     async def generate_batch(self,
                              prompts: List[Tuple[str, str]],
@@ -90,17 +92,12 @@ class AsyncGenerator:
         # type: ignore (위에서 모두 채워짐)
         return results  # type: ignore
 
-    async def run(self, query_path: str, output_path: str, max_concurrent: int = 40):
-        self.log(f"Loading queries from {query_path}")
-        queries, original_queries = self.load_queries(query_path)
-        self.log(f"Total queries: {len(queries)}")
-
+    async def run(self, queries: List[Tuple[str, str]], original_queries: List[Dict[str, Any]], output_path: str, max_concurrent: int = 40):
         out_dir = os.path.dirname(output_path) or "."
         os.makedirs(out_dir, exist_ok=True)
 
         mode = "a" if os.path.exists(output_path) else "w"
         self.log(f"Writing to {output_path} (mode={mode})")
-
         with jsonlines.open(output_path, mode=mode, flush=True) as writer:
             for begin in range(0, len(queries), max_concurrent):
                 end = min(begin + max_concurrent, len(queries))
@@ -122,22 +119,59 @@ class AsyncGenerator:
                 self.log(f"Generated {end}/{len(queries)} queries")
 
 if __name__ == "__main__":
+    import argparse, math
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, default="127.0.0.1:8000")
+    parser.add_argument("--ratio", type=float, default=0.2)
+    parser.add_argument("--timeout_s", type=float, default=240.0)
+    parser.add_argument("--max_retries", type=int, default=5)
+    parser.add_argument("--max_concurrent", type=int, default=84)
+    args = parser.parse_args()
+    ratio = args.ratio
     import glob
     # 클러스터 내부 기본값: 헤드 서비스의 Serve 포트(8000)
     SERVE_HOST = os.getenv(
         "RAY_SERVE_HOST",
-        "127.0.0.1:8000"
+        args.host
     )
     generator = AsyncGenerator(
         model_name="deepseek-ai/DeepSeek-V3.1",   # 서버에 등록된 모델명과 정확히 일치
-        host=f"http://127.0.0.1:8000",              # ← Ray Serve 주소로!
-        timeout_s=120.0,
-        max_retries=5,                            # ← 재시도는 여기서 설정됨
+        host=f"http://{args.host}",              # ← Ray Serve 주소로!
+        timeout_s=args.timeout_s,
+        max_retries=args.max_retries,                            # ← 재시도는 여기서 설정됨
     )
     jsonl_files = glob.glob("/data/datasets/dedup_dataset/*.jsonl")
-    for jsonl_file in jsonl_files:
-        asyncio.run(generator.run(
-            query_path=jsonl_file,
-            output_path=jsonl_file.replace(".jsonl", "_generated.jsonl").replace("dedup_dataset", "dedup_generated"),
-            max_concurrent=24,
-        ))
+    total_iteration = math.ceil(1.0 / ratio)
+    for i in range(total_iteration):
+        for jsonl_file in jsonl_files:
+            generator.log(f"Loading queries from {jsonl_file}")
+            queries, original_queries = generator.load_queries(jsonl_file)
+            n = len(queries)
+            generator.log(f"Loaded {n} queries")
+            
+            # 각 iteration의 슬라이스 범위 계산
+            if i < total_iteration - 1:
+                start = math.floor(n * ratio * i)
+                end = math.floor(n * ratio * (i + 1))
+            else:
+                # 마지막 iteration: 남은 전부 처리
+                start = math.floor(n * ratio * i)
+                end = n
+
+            # 비어있는 경우 스킵
+            if start >= n or end <= start:
+                generator.log(f"Iteration {i}: empty slice (start={start}, end={end}), skipping")
+                continue
+
+            q_slice = queries[start:end]
+            oq_slice = original_queries[start:end]
+            generator.log(
+                f"Iteration {i}: total={n}, ratio={ratio}, slice=[{start}:{end}] => {len(q_slice)} queries"
+            )
+            
+            asyncio.run(generator.run(
+                queries=q_slice,
+                original_queries=oq_slice,
+                output_path=jsonl_file.replace(".jsonl", "_generated.jsonl").replace("dedup_dataset", "dedup_generated"),
+                max_concurrent=args.max_concurrent,
+            ))

@@ -4,7 +4,7 @@ metadata:
   name: ray-ku-junyoung-workers
   namespace: p-ncai-wbl
 spec:
-  replicas: 2
+  replicas: 6
   selector:
     matchLabels:
       app: ray-ku-junyoung-worker
@@ -64,7 +64,7 @@ spec:
 
       containers:
       - name: ray-ku-junyoung-worker
-        image: sjysjy/ray_serving:0.990
+        image: sjysjy/ray_serving:0.994
         imagePullPolicy: IfNotPresent
 
         env:
@@ -106,6 +106,10 @@ spec:
         volumeMounts:
         - { name: nlpai-data, mountPath: /data }
         - { name: dshm,      mountPath: /dev/shm }
+
+        securityContext:  # Infiniband 를 사용하기 위함
+          capabilities:
+            add: ["IPC_LOCK"]
 
         command: ["/bin/bash", "-lc"]
         args:
