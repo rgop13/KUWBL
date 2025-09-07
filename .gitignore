@@ -1,2 +1,8 @@
 .vscode
 KURE/
+__pycache__/
+DATA/250906_tool_fc_datasets.jsonl
+DATA/250906_tool_nonfc_datasets.jsonl
+DATA/data_example.jsonl
+secret/
+*.ipynb

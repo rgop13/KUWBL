@@ -1,25 +1,36 @@
 FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
 USER root
-# ---- OS 패키지 --------------------------------------------------
+
+# ---- OS & RDMA 유저스페이스 ------------------------------------------------
+# - rdma-core/ibverbs-providers/librdmacm1: RDMA 사용자 공간 라이브러리/프로바이더
+# - infiniband-diags, perftest: RDMA 진단/벤치마크(ibstat, ibv_devinfo, ib_read_bw 등)
+# - numactl/pciutils/ethtool/iproute2: 디버깅/튜닝에 유용
 RUN apt-get update && \
-DEBIAN_FRONTEND=noninteractive \
-apt-get install -y --no-install-recommends libibverbs1 openssh-client git curl ca-certificates sudo vim && rm -rf /var/lib/apt/lists/*
-
-# Python & 빌드 툴
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl wget git openssh-client sudo vim tzdata locales \
+      # RDMA/IB 유저스페이스
+      rdma-core libibverbs1 ibverbs-providers librdmacm1 \
+      infiniband-diags perftest \
+      # 디버깅/네트워킹 유틸
+      numactl pciutils ethtool iproute2 net-tools netcat-openbsd dnsutils \
+      # Python & 빌드 툴
       python3 python3-pip python3-venv python3-dev \
-      build-essential pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+      build-essential pkg-config cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/* \
+    && ldconfig
 
-# (OS 패키지 설치 이후, pip 업그레이드 이전 정도 위치에 추가)
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends locales \
+# ---- 로케일/UTF-8 ----------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends locales \
  && echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen \
  && echo "ko_KR.UTF-8 UTF-8" >> /etc/locale.gen \
  && locale-gen \
- && update-locale LANG=ko_KR.UTF-8 LC_ALL=ko_KR.UTF-8
+ && update-locale LANG=ko_KR.UTF-8 LC_ALL=ko_KR.UTF-8 \
+ && rm -rf /var/lib/apt/lists/*
 
-# 터미널/파이썬/less가 UTF-8 쓰도록
 ENV LANG=ko_KR.UTF-8 \
     LC_ALL=ko_KR.UTF-8 \
     LANGUAGE=ko_KR:ko \
@@ -27,42 +38,72 @@ ENV LANG=ko_KR.UTF-8 \
     LESSCHARSET=utf-8 \
     TERM=xterm-256color
 
-# pip 업그레이드
-RUN python3 -m pip install --upgrade pip setuptools wheel
+# ---- Conda 경로 ----------------------------------------------------------
+# conda 경로를 PATH에 추가
+ENV PATH="/data/data_team/miniconda3/bin:$PATH"
 
-# 기본 editor를 vim으로 설정(실패해도 빌드 진행)
-RUN update-alternatives --set editor /usr/bin/vim.basic || true
+# 기본 editor를 vim으로 설정(실패해도 빌드 계속)
+RUN update-alternatives --set editor /usr/bin/vim.basic || true && \
+    printf '%s\n' \
+      'set encoding=utf-8' \
+      'set fileencodings=utf-8,cp949,euc-kr,latin1' \
+      'set termencoding=utf-8' \
+      'set helplang=ko' \
+      'set fileformats=unix,dos' \
+      > /etc/vim/vimrc.local
 
-RUN printf '%s\n' \
-  'set encoding=utf-8' \
-  'set fileencodings=utf-8,cp949,euc-kr,latin1' \
-  'set termencoding=utf-8' \
-  'set helplang=ko' \
-  'set fileformats=unix,dos' \
-  > /etc/vim/vimrc.local
 
-RUN pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 && pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation
-RUN pip install --no-cache-dir xformers==0.0.31 flashinfer-python==0.2.14.post1 ray[serve-grpc,client] openai==1.102.0 huggingface-hub==0.34.4
-RUN pip install --no-cache-dir transformers==4.55.4 && pip install --no-cache-dir pydantic==2.11.7 && pip install --no-cache-dir gymnasium dm-tree && pip install --no-cache-dir vllm==0.10.1.1 && pip install --no-cache-dir pyarrow==21.0.0 pandas==2.3.2 lz4 jsonlines fsspec hf_transfer
+# ---- 작업 디렉터리 ----------------------------------------------------------
 RUN mkdir -p /opt/WBL/DATA/serving
-
 WORKDIR /opt/WBL/DATA/serving
 
-# --- UID/GID 500 사용자 생성 & sudo 권한 부여 --------------------
+# --- UID/GID 500 사용자 생성 & sudo 권한 ------------------------------------
 RUN groupadd -g 500 app || true && \
     id -u 500 >/dev/null 2>&1 || useradd -m -u 500 -g 500 -s /bin/bash app && \
     echo 'app ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-app && \
     chmod 0440 /etc/sudoers.d/90-app
-# 고성능 스토리지 사용을 위해서는 UID 500, GID 500 권한 필요
-USER 500:500 
-COPY generate_response.py /opt/WBL/DATA/generate_response.py
-COPY serving/serve_head_api.py /opt/WBL/DATA/serving/serve_head_api.py
-COPY serving/download_deepseek.py /opt/WBL/DATA/serving/download_deepseek.py
 
-# ---- (옵션) NCCL 안정화 -----------------------------------------------
-ENV NCCL_ASYNC_ERROR_HANDLING=1 NCCL_LAUNCH_MODE=GROUP
+USER 500:500
+COPY generate /opt/WBL/DATA/generate
+COPY serving /opt/WBL/DATA/serving
+COPY secret /opt/WBL/DATA/secret
+COPY view /opt/WBL/DATA/view
+COPY prompt /opt/WBL/DATA/prompt
+COPY yaml /opt/WBL/DATA/yaml
+COPY gen_test.ipynb /opt/WBL/DATA/gen_test.ipynb
 
-# ---- Hugging Face / Transformers 캐시 경로 ----------------------------
+USER root
+RUN chown -R 500:500 /opt/WBL/* && chmod -R 775 /opt/WBL/*
+USER 500:500
+
+# ---- Hugging Face / Transformers 캐시 경로 ---------------------------------
 ENV HF_HOME=/data/data_team/cache/huggingface \
-TRANSFORMERS_CACHE=/data/data_team/cache/huggingface/transformers \
-HF_DATASETS_CACHE=/data/data_team/cache/huggingface/datasets
+    TRANSFORMERS_CACHE=/data/data_team/cache/huggingface/transformers \
+    HF_DATASETS_CACHE=/data/data_team/cache/huggingface/datasets
+
+# ---- NCCL/RDMA & 네트워크 안정화 기본값 ------------------------------------
+# ※ K8s에서 파드 env로 쉽게 덮어쓸 수 있도록 "기본값"만 제공합니다.
+# RDMA 경로: NCCL_IB_DISABLE=0, TCP fallback: NCCL_SOCKET_* 유지
+ENV RDMAV_FORK_SAFE=1 \
+    NCCL_IB_DISABLE=0 \
+    NCCL_NET_GDR_LEVEL=2 \
+    NCCL_ASYNC_ERROR_HANDLING=1 \
+    TORCH_NCCL_BLOCKING_WAIT=1 \
+    NCCL_SOCKET_FAMILY=AF_INET \
+    NCCL_DEBUG=INFO \
+    NCCL_DEBUG_SUBSYS=INIT,NET \
+    NO_PROXY=localhost,127.0.0.1,.svc,.cluster.local
+# (선택) RoCE 환경에서 필요 시 GID index 지정
+# ENV NCCL_IB_GID_INDEX=3
+# (선택) 특정 HCA를 강제할 때
+# ENV NCCL_IB_HCA=mlx5_0,mlx5_1
+# (선택) 타임아웃/재시도 튜닝(네트워크 품질에 따라)
+# ENV NCCL_IB_TIMEOUT=22 NCCL_IB_RETRY_CNT=7
+# (선택) TCP 경로 튜닝(IB 비사용 시)
+# ENV NCCL_NSOCKS_PERTHREAD=2 NCCL_SOCKET_NTHREADS=2
+
+# 임시: RDMA 확인 스크립트(원하면 K8s initContainer에서 실행)
+# USER root
+# RUN echo -e '#!/usr/bin/env bash\nset -e\nibv_devinfo -l || true\nibv_devices || true\n' > /usr/local/bin/check-rdma && \
+#     chmod +x /usr/local/bin/check-rdma
+# USER 500:500

@@ -1,0 +1,75 @@
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
+
+USER root
+# ---- OS 패키지 --------------------------------------------------
+RUN apt-get update && \
+DEBIAN_FRONTEND=noninteractive \
+apt-get install -y --no-install-recommends libibverbs1 openssh-client git curl ca-certificates sudo vim && rm -rf /var/lib/apt/lists/*
+
+# Python & 빌드 툴
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv python3-dev \
+      build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# (OS 패키지 설치 이후, pip 업그레이드 이전 정도 위치에 추가)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends locales \
+ && echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen \
+ && echo "ko_KR.UTF-8 UTF-8" >> /etc/locale.gen \
+ && locale-gen \
+ && update-locale LANG=ko_KR.UTF-8 LC_ALL=ko_KR.UTF-8
+
+# 터미널/파이썬/less가 UTF-8 쓰도록
+ENV LANG=ko_KR.UTF-8 \
+    LC_ALL=ko_KR.UTF-8 \
+    LANGUAGE=ko_KR:ko \
+    PYTHONUTF8=1 \
+    LESSCHARSET=utf-8 \
+    TERM=xterm-256color
+
+# pip 업그레이드
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# 기본 editor를 vim으로 설정(실패해도 빌드 진행)
+RUN update-alternatives --set editor /usr/bin/vim.basic || true
+
+RUN printf '%s\n' \
+  'set encoding=utf-8' \
+  'set fileencodings=utf-8,cp949,euc-kr,latin1' \
+  'set termencoding=utf-8' \
+  'set helplang=ko' \
+  'set fileformats=unix,dos' \
+  > /etc/vim/vimrc.local
+
+RUN pip install --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 && pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation
+RUN pip install --no-cache-dir xformers==0.0.31 flashinfer-python==0.2.14.post1 ray[serve-grpc,client] openai==1.102.0 huggingface-hub==0.34.4
+RUN pip install --no-cache-dir transformers==4.55.4 && pip install --no-cache-dir pydantic==2.11.7 && pip install --no-cache-dir gymnasium dm-tree && pip install --no-cache-dir vllm==0.10.1.1 && pip install --no-cache-dir pyarrow==21.0.0 pandas==2.3.2 lz4 jsonlines fsspec hf_transfer together
+RUN mkdir -p /opt/WBL/DATA/serving
+
+WORKDIR /opt/WBL/DATA/serving
+
+# --- UID/GID 500 사용자 생성 & sudo 권한 부여 --------------------
+RUN groupadd -g 500 app || true && \
+    id -u 500 >/dev/null 2>&1 || useradd -m -u 500 -g 500 -s /bin/bash app && \
+    echo 'app ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-app && \
+    chmod 0440 /etc/sudoers.d/90-app
+# 고성능 스토리지 사용을 위해서는 UID 500, GID 500 권한 필요
+USER 500:500 
+COPY generate /opt/WBL/DATA/generate
+COPY serving /opt/WBL/DATA/serving
+COPY secret /opt/WBL/DATA/secret
+COPY view /opt/WBL/DATA/view
+COPY prompt /opt/WBL/DATA/prompt
+COPY yaml /opt/WBL/DATA/yaml
+COPY gen_test.ipynb /opt/WBL/DATA/gen_test.ipynb
+
+# Change owner and permissions of /opt/WBL/* to 500:500 and 775
+RUN sudo chown -R 500:500 /opt/WBL/* && sudo chmod -R 775 /opt/WBL/*
+
+# ---- (옵션) NCCL 안정화 -----------------------------------------------
+ENV NCCL_ASYNC_ERROR_HANDLING=1 NCCL_LAUNCH_MODE=GROUP
+
+# ---- Hugging Face / Transformers 캐시 경로 ----------------------------
+ENV HF_HOME=/data/data_team/cache/huggingface \
+TRANSFORMERS_CACHE=/data/data_team/cache/huggingface/transformers \
+HF_DATASETS_CACHE=/data/data_team/cache/huggingface/datasets

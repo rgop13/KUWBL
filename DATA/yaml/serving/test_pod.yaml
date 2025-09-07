@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-smoke
+  namespace: p-ncai-wbl
+  annotations:
+    sidecar.istio.io/inject: "false"   # ← 사이드카 주입 끔
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    mlx.navercorp.com/zone: h100-i001v8
+  containers:
+  - name: chk
+    image: sjysjy/ray_serving:1.015
+    command: ["bash","-lc","ibv_devinfo -l || true; ls -l /sys/class/infiniband || true; sleep 5"]
+    resources:
+      requests:
+        rdma/hca_shared_devices_a: 1   # ← 여기 이름으로 스케줄 되는지 확인
+      limits:
+        rdma/hca_shared_devices_a: 1

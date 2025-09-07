@@ -1,0 +1,267 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-ku-junyoung-workers
+  namespace: p-ncai-wbl
+spec:
+  replicas: 64
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0              # GPU 노드 여유가 적을 때 안전
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ray-ku-junyoung-worker
+  template:
+    metadata:
+      labels:
+        app: ray-ku-junyoung-worker
+        ray-cluster: ray-ku-junyoung
+      annotations:
+        sidecar.istio.io/inject: "false"
+        # (선택) Multus로 IB 전용 네트워크를 붙이는 경우:
+        # k8s.v1.cni.cncf.io/networks: mellanox-net-attach-def
+    spec:
+      terminationGracePeriodSeconds: 120
+      enableServiceLinks: false
+      dnsConfig:
+        options:
+        - name: ndots
+          value: "1"
+        - name: single-request-reopen
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 500
+        runAsGroup: 500
+        fsGroup: 500
+        fsGroupChangePolicy: "OnRootMismatch"
+
+        sysctls:
+        - name: net.ipv4.tcp_keepalive_time
+          value: "60"
+        - name: net.ipv4.tcp_keepalive_intvl
+          value: "30"
+        - name: net.ipv4.tcp_keepalive_probes
+          value: "4"
+
+      nodeSelector:
+        mlx.navercorp.com/zone: h100-i001v8
+
+      # 동일 노드 중복 스케줄 방지
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["ray-ku-junyoung-worker"]
+            topologyKey: "kubernetes.io/hostname"
+
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: ray-ku-junyoung-worker
+
+      volumes:
+      - name: nlpai-data
+        persistentVolumeClaim:
+          claimName: nlpai-storage
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+
+      containers:
+      - name: ray-ku-junyoung-worker
+        image: sjysjy/ray_serving:1.015
+        imagePullPolicy: IfNotPresent
+
+        env:
+        # ---- Ray ----
+        - name: MY_POD_IP
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }
+        - name: RAY_ADDRESS
+          value: "ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:6379"
+        - name: RAY_object_spilling_config
+          value: |
+            {"type": "filesystem", "params":{"directory_path": "/data/ray_spill"}, "buffer_size": "8Gi"}
+        - { name: RAY_BACKEND_LOG_LEVEL, value: "debug" }
+        - { name: RAY_VERBOSE, value: "1" }
+
+        # 무거운 모델 환경 안정성 설정
+        - { name: RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE, value: "1" }
+        - { name: RAY_ENABLE_RECORD_TASK_EVENTS, value: "1" }
+        - { name: RAY_DEDUP_LOGS, value: "0" }
+        - { name: RAY_DISABLE_IMPORT_WARNING, value: "1" }
+        - { name: PYTHONUNBUFFERED, value: "1" }
+        - { name: MALLOC_TRIM_THRESHOLD_, value: "0" }
+
+        # ---- RDMA/NCCL (IB 활성화 + TCP 폴백) ----
+        - { name: NCCL_IB_DISABLE, value: "0" }           # RDMA 사용
+        - { name: NCCL_NET_GDR_LEVEL, value: "2" }        # GPUDirect RDMA 선호(가능 시)
+        # 필요 시 사용 HCA 지정(실제 이름으로 교체: mlx5_0,mlx5_1 등)
+        # - { name: NCCL_IB_HCA, value: "mlx5_0,mlx5_1" }
+        - { name: NCCL_IB_HCA,     value: "mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5" }
+        - { name: NCCL_IB_GID_INDEX, value: "0" }   # IB는 보통 0 (RoCE만 신경)
+        # RoCE 환경이면 GID index 조정이 필요할 수 있음(IB 순수 환경이면 불필요)
+        # - { name: NCCL_IB_GID_INDEX, value: "3" }
+        # QP 수/타임아웃 등 튜닝(환경 따라 조정)
+        # - { name: NCCL_IB_QPS_PER_CONNECTION, value: "4" }
+        # - { name: NCCL_IB_TIMEOUT, value: "22" }
+        # - { name: NCCL_IB_RETRY_CNT, value: "7" }
+
+        # TCP 경로(폴백) 및 디버그
+        - { name: NCCL_SOCKET_IFNAME, value: "eth0" }
+        - { name: NCCL_SOCKET_FAMILY, value: "AF_INET" }
+        - { name: GLOO_SOCKET_IFNAME, value: "eth0" }
+        - { name: GLOO_USE_IPV6, value: "0" }
+        - { name: TP_USE_IPV6, value: "0" }
+        - { name: GLOO_USE_LIBUV, value: "0" }
+        - { name: NCCL_DEBUG, value: "INFO" }
+        - { name: NCCL_DEBUG_SUBSYS, value: "INIT,NET" }
+        - { name: TORCH_NCCL_BLOCKING_WAIT, value: "1" }
+        - { name: NCCL_ASYNC_ERROR_HANDLING, value: "1" }
+        # 대량 연결/프록시 우회
+        - { name: NO_PROXY, value: "localhost,127.0.0.1,.svc,.cluster.local" }
+        # (선택) TCP만 쓸 때 소켓 스레드 튜닝
+        # - { name: NCCL_NSOCKS_PERTHREAD, value: "2" }
+        # - { name: NCCL_SOCKET_NTHREADS, value: "2" }
+
+        # ---- HF 캐시 ----
+        - { name: HF_HOME,             value: "/data/data_team/cache/huggingface" }
+        - { name: HF_HUB_CACHE,        value: "/data/data_team/cache/huggingface" }
+        - { name: TRANSFORMERS_CACHE,  value: "/data/data_team/cache/huggingface/transformers" }
+        - { name: HF_DATASETS_CACHE,   value: "/data/data_team/cache/huggingface/datasets" }
+        - { name: VLLM_DOWNLOAD_DIR,   value: "/data/data_team/cache/huggingface" }
+        - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+        - { name: VLLM_USE_V1, value: "1" }
+        # PG 교착 기본 방어
+        - { name: RAY_PLACEMENT_GROUP_CAPTURE_CHILD_TASKS, value: "0" }
+
+        volumeMounts:
+        - { name: nlpai-data, mountPath: /data }
+        - { name: dshm,      mountPath: /dev/shm }
+
+        securityContext:
+          capabilities:
+            add: ["IPC_LOCK"]
+
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -e
+          echo "=== RDMA autodetect ==="
+          if compgen -G "/dev/infiniband/uverbs*" > /dev/null; then
+            echo "✓ RDMA devices found: $(ls /dev/infiniband)"
+            export NCCL_IB_DISABLE=0
+          else
+            echo "! No RDMA devices; falling back to TCP"
+            export NCCL_IB_DISABLE=1
+          fi
+
+          echo "=== Ray Worker Startup (Heavy Model Optimized) ==="
+          ulimit -n 1048576 || true
+          ulimit -l unlimited || true
+          ulimit -c unlimited || true
+
+          # Head 도달 확인
+          RAY_HEAD_HOST=$(echo ${RAY_ADDRESS} | cut -d: -f1)
+          RAY_HEAD_PORT=$(echo ${RAY_ADDRESS} | cut -d: -f2)
+          for i in {1..60}; do
+            if nc -z ${RAY_HEAD_HOST} ${RAY_HEAD_PORT}; then
+              echo "✓ Ray Head connection verified"
+              break
+            fi
+            echo "Waiting for Ray Head... (attempt $i/60)"
+            sleep 5
+          done
+
+          # ⬇️ Head와 동일한 내부 포트로 고정
+          exec ray start \
+            --address=${RAY_ADDRESS} \
+            --node-ip-address=${MY_POD_IP} \
+            --object-manager-port=8076 \
+            --node-manager-port=8077 \
+            --min-worker-port=30000 \
+            --max-worker-port=30200 \
+            --num-gpus=8 \
+            --num-cpus=16 \
+            --resources='{"accelerator_type:H100": 8}' \
+            --block
+
+        # readiness를 “실제 ray.init() 가능 여부”로 체크 → 대시보드 의존도↓
+        readinessProbe:
+          exec:
+            command:
+              - /bin/bash
+              - -lc
+              - |
+                python3 - <<'PY'
+                import os, sys, ray
+                try:
+                    ray.init(address=os.getenv("RAY_ADDRESS"), namespace="serve", ignore_reinit_error=True, logging_level="ERROR")
+                    r = ray.cluster_resources()
+                    assert isinstance(r, dict)
+                    print("ok")
+                    sys.exit(0)
+                except Exception as e:
+                    print("not ready:", e)
+                    sys.exit(1)
+                PY
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 15
+          failureThreshold: 6   # 3분 유예
+          successThreshold: 1
+
+        livenessProbe:
+          exec:
+            command: ["bash","-lc","pgrep -f raylet >/dev/null 2>&1 || exit 1"]
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 30
+          failureThreshold: 10
+
+        startupProbe:
+          exec:
+            command: ["bash","-lc","python3 - <<'PY'\nimport os, sys, ray\nray.init(address=os.getenv('RAY_ADDRESS'), ignore_reinit_error=True)\nprint('up')\nPY"]
+          initialDelaySeconds: 90
+          periodSeconds: 30
+          timeoutSeconds: 30
+          failureThreshold: 80
+
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+            cpu: "16"
+            memory: "512Gi"
+            rdma/hca_shared_devices_a: "1"
+          requests:
+            nvidia.com/gpu: "8"
+            cpu: "12"                       # 최소 보장
+            memory: "384Gi"                 # 최소 보장
+            rdma/hca_shared_devices_a: "1"
+        
+        ports:
+        # 네트워크 정책 가시성/허용규칙에 도움 (필수는 아님)
+        - { containerPort: 8076, name: objmgr }
+        - { containerPort: 8077, name: nodemgr }
+        - { containerPort: 30000, name: wkrange-start }   # 범위 시작만 메모용 표기
+
+      # (선택) PDB로 가용성 보장: 별도 리소스로 생성 권장
+      # apiVersion: policy/v1
+      # kind: PodDisruptionBudget
+      # metadata:
+      #   name: ray-ku-junyoung-worker-pdb
+      #   namespace: p-ncai-wbl
+      # spec:
+      #   maxUnavailable: 1
+      #   selector:
+      #     matchLabels:
+      #       app: ray-ku-junyoung-worker

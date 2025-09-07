@@ -1,0 +1,374 @@
+# Ray 클러스터 로드 밸런싱 최적화 가이드
+# 각 컴포넌트별 최적 설정 및 성능 튜닝
+
+---
+# 1. Ray Serve Service - 로드 분산 최적화
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-deepseek-serve-optimized
+  namespace: p-ncai-wbl
+  labels:
+    app: ray-deepseek-serve
+    ray-cluster: ray-ku-junyoung
+    component: ray-serve
+    optimization: load-balanced
+  annotations:
+    # 로드 밸런싱 최적화 어노테이션
+    service.kubernetes.io/topology-aware-hints: "auto"
+    service.kubernetes.io/load-balancer-source-ranges: "0.0.0.0/0"
+spec:
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [ IPv4 ]
+  selector:
+    app: ray-deepseek-serve
+    ray-cluster: ray-ku-junyoung
+  # 🎯 핵심: sessionAffinity 비활성화로 완전한 로드 분산
+  sessionAffinity: None
+  # internalTrafficPolicy 제거 - 클러스터 전체 분산
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    appProtocol: http
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+    appProtocol: http
+
+---
+# 2. Ray Head Service - 서비스 디스커버리 최적화
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-ku-junyoung-head-optimized
+  namespace: p-ncai-wbl
+  labels:
+    app: ray-ku-junyoung-head
+    ray-cluster: ray-ku-junyoung
+    component: ray-head
+spec:
+  # Headless 서비스 - 직접 Pod IP 반환
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [ IPv4 ]
+  selector:
+    app: ray-ku-junyoung-head
+    ray-cluster: ray-ku-junyoung
+  ports:
+  - name: gcs
+    port: 6379
+    targetPort: 6379
+  - name: dashboard
+    port: 8265
+    targetPort: 8265
+  - name: client
+    port: 10001
+    targetPort: 10001
+
+---
+# 3. 성능 비교를 위한 테스트 Service (sessionAffinity 활성화)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-deepseek-serve-sticky
+  namespace: p-ncai-wbl
+  labels:
+    app: ray-deepseek-serve
+    ray-cluster: ray-ku-junyoung
+    component: ray-serve
+    optimization: session-sticky
+spec:
+  type: ClusterIP
+  selector:
+    app: ray-deepseek-serve
+    ray-cluster: ray-ku-junyoung
+  # 비교용: sessionAffinity 활성화
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+
+---
+# 4. 로드 밸런싱 테스트용 ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: load-balancing-test
+  namespace: p-ncai-wbl
+  labels:
+    component: testing
+data:
+  test_load_distribution.py: |
+    #!/usr/bin/env python3
+    """
+    로드 밸런싱 분산 테스트 스크립트
+    여러 서비스 설정의 로드 분산 효과를 비교
+    """
+    import asyncio
+    import aiohttp
+    import time
+    import json
+    from collections import defaultdict
+    from typing import Dict, List
+    
+    class LoadBalancingTester:
+        def __init__(self):
+            self.response_sources = defaultdict(int)
+            self.response_times = []
+            
+        async def test_service(self, service_url: str, num_requests: int = 100):
+            """특정 서비스의 로드 분산 테스트"""
+            print(f"Testing load balancing for: {service_url}")
+            
+            async with aiohttp.ClientSession() as session:
+                tasks = []
+                for i in range(num_requests):
+                    tasks.append(self.make_request(session, service_url, i))
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+            self.analyze_results(results)
+        
+        async def make_request(self, session: aiohttp.ClientSession, url: str, request_id: int):
+            """단일 요청 실행"""
+            start_time = time.time()
+            try:
+                async with session.get(f"{url}/v1/models", timeout=10) as response:
+                    response_time = time.time() - start_time
+                    self.response_times.append(response_time)
+                    
+                    # 응답 헤더에서 서버 정보 추출 (가능한 경우)
+                    server_info = response.headers.get('Server', 'unknown')
+                    pod_name = response.headers.get('X-Pod-Name', f'pod-{hash(str(response)) % 10}')
+                    
+                    self.response_sources[pod_name] += 1
+                    
+                    return {
+                        'request_id': request_id,
+                        'status': response.status,
+                        'response_time': response_time,
+                        'server': server_info,
+                        'pod': pod_name
+                    }
+            except Exception as e:
+                return {
+                    'request_id': request_id,
+                    'error': str(e),
+                    'response_time': time.time() - start_time
+                }
+        
+        def analyze_results(self, results: List):
+            """결과 분석 및 출력"""
+            successful_requests = [r for r in results if isinstance(r, dict) and 'status' in r]
+            failed_requests = [r for r in results if isinstance(r, dict) and 'error' in r]
+            
+            print(f"\n=== Load Balancing Analysis ===")
+            print(f"Total requests: {len(results)}")
+            print(f"Successful: {len(successful_requests)}")
+            print(f"Failed: {len(failed_requests)}")
+            
+            if self.response_sources:
+                print(f"\n=== Load Distribution ===")
+                total_responses = sum(self.response_sources.values())
+                for pod, count in sorted(self.response_sources.items()):
+                    percentage = (count / total_responses) * 100
+                    print(f"{pod}: {count} requests ({percentage:.1f}%)")
+                
+                # 분산 균등성 계산
+                expected_per_pod = total_responses / len(self.response_sources)
+                variance = sum((count - expected_per_pod) ** 2 for count in self.response_sources.values()) / len(self.response_sources)
+                print(f"\nLoad distribution variance: {variance:.2f}")
+                print(f"Lower variance = better load balancing")
+            
+            if self.response_times:
+                avg_time = sum(self.response_times) / len(self.response_times)
+                print(f"\nAverage response time: {avg_time*1000:.1f}ms")
+    
+    async def compare_services():
+        """여러 서비스 설정 비교"""
+        services = {
+            "Optimized (No sessionAffinity)": "http://ray-deepseek-serve-optimized.p-ncai-wbl.svc.cluster.local:8000",
+            "Sticky (sessionAffinity: ClientIP)": "http://ray-deepseek-serve-sticky.p-ncai-wbl.svc.cluster.local:8000",
+            "Default": "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+        }
+        
+        for name, url in services.items():
+            print(f"\n{'='*50}")
+            print(f"Testing: {name}")
+            print(f"{'='*50}")
+            
+            tester = LoadBalancingTester()
+            try:
+                await tester.test_service(url, num_requests=50)
+            except Exception as e:
+                print(f"Error testing {name}: {e}")
+            
+            # 테스트 간 간격
+            await asyncio.sleep(2)
+    
+    if __name__ == "__main__":
+        asyncio.run(compare_services())
+  
+  benchmark_concurrent_load.py: |
+    #!/usr/bin/env python3
+    """
+    동시 요청 부하 테스트
+    sessionAffinity 설정에 따른 성능 차이 측정
+    """
+    import asyncio
+    import aiohttp
+    import time
+    import statistics
+    from typing import List, Dict
+    
+    async def concurrent_load_test(service_url: str, concurrent_requests: int, total_requests: int):
+        """동시 요청 부하 테스트"""
+        print(f"Load testing: {service_url}")
+        print(f"Concurrent: {concurrent_requests}, Total: {total_requests}")
+        
+        semaphore = asyncio.Semaphore(concurrent_requests)
+        response_times = []
+        errors = []
+        
+        async def make_request(session: aiohttp.ClientSession, request_id: int):
+            async with semaphore:
+                start_time = time.time()
+                try:
+                    async with session.get(f"{service_url}/v1/models", timeout=30) as response:
+                        await response.text()
+                        response_time = time.time() - start_time
+                        response_times.append(response_time)
+                        return response.status
+                except Exception as e:
+                    errors.append(str(e))
+                    return None
+        
+        # 테스트 실행
+        start_time = time.time()
+        async with aiohttp.ClientSession() as session:
+            tasks = [make_request(session, i) for i in range(total_requests)]
+            results = await asyncio.gather(*tasks)
+        
+        total_time = time.time() - start_time
+        
+        # 결과 분석
+        successful = len([r for r in results if r is not None])
+        failed = len(errors)
+        
+        if response_times:
+            p50 = statistics.median(response_times) * 1000
+            p95 = statistics.quantiles(response_times, n=20)[18] * 1000 if len(response_times) > 20 else p50
+            avg_time = statistics.mean(response_times) * 1000
+        else:
+            p50 = p95 = avg_time = 0
+        
+        throughput = successful / total_time
+        error_rate = (failed / total_requests) * 100
+        
+        print(f"\n=== Results ===")
+        print(f"Total time: {total_time:.1f}s")
+        print(f"Successful requests: {successful}")
+        print(f"Failed requests: {failed}")
+        print(f"Error rate: {error_rate:.1f}%")
+        print(f"Throughput: {throughput:.1f} req/s")
+        print(f"Response times - P50: {p50:.1f}ms, P95: {p95:.1f}ms, Avg: {avg_time:.1f}ms")
+        
+        return {
+            'throughput': throughput,
+            'error_rate': error_rate,
+            'p50': p50,
+            'p95': p95,
+            'successful': successful,
+            'failed': failed
+        }
+    
+    async def compare_load_balancing():
+        """로드 밸런싱 설정별 성능 비교"""
+        test_configs = [
+            ("Optimized", "http://ray-deepseek-serve-optimized.p-ncai-wbl.svc.cluster.local:8000"),
+            ("Sticky", "http://ray-deepseek-serve-sticky.p-ncai-wbl.svc.cluster.local:8000"),
+        ]
+        
+        concurrent_levels = [10, 20, 40, 60]
+        
+        for config_name, service_url in test_configs:
+            print(f"\n{'='*60}")
+            print(f"Testing Configuration: {config_name}")
+            print(f"{'='*60}")
+            
+            for concurrent in concurrent_levels:
+                print(f"\n--- Concurrent Level: {concurrent} ---")
+                try:
+                    await concurrent_load_test(service_url, concurrent, concurrent * 5)
+                    await asyncio.sleep(5)  # 테스트 간 휴식
+                except Exception as e:
+                    print(f"Error: {e}")
+    
+    if __name__ == "__main__":
+        asyncio.run(compare_load_balancing())
+  
+  apply_optimized_config.sh: |
+    #!/bin/bash
+    # 최적화된 로드 밸런싱 설정 적용 스크립트
+    
+    NAMESPACE="p-ncai-wbl"
+    
+    echo "=== Applying Optimized Load Balancing Configuration ==="
+    
+    # 1. 기존 서비스 백업
+    echo "Backing up existing services..."
+    kubectl get service ray-deepseek-serve -n $NAMESPACE -o yaml > /tmp/ray-deepseek-serve-backup.yaml
+    kubectl get service ray-ku-junyoung-serve -n $NAMESPACE -o yaml > /tmp/ray-ku-junyoung-serve-backup.yaml 2>/dev/null || true
+    
+    # 2. 최적화된 설정 적용
+    echo "Applying optimized load balancing services..."
+    kubectl apply -f /config/load_balancing_guide.yaml
+    
+    # 3. 기존 서비스 업데이트
+    echo "Updating existing services..."
+    
+    # ray-deepseek-serve 서비스 업데이트
+    kubectl patch service ray-deepseek-serve -n $NAMESPACE -p '{
+      "spec": {
+        "sessionAffinity": "None"
+      }
+    }'
+    
+    # sessionAffinityConfig 제거
+    kubectl patch service ray-deepseek-serve -n $NAMESPACE --type='merge' -p '{
+      "spec": {
+        "sessionAffinityConfig": null
+      }
+    }'
+    
+    # ray-ku-junyoung-serve 서비스도 동일하게 업데이트 (존재하는 경우)
+    if kubectl get service ray-ku-junyoung-serve -n $NAMESPACE >/dev/null 2>&1; then
+        kubectl patch service ray-ku-junyoung-serve -n $NAMESPACE -p '{
+          "spec": {
+            "sessionAffinity": "None"
+          }
+        }'
+        kubectl patch service ray-ku-junyoung-serve -n $NAMESPACE --type='merge' -p '{
+          "spec": {
+            "sessionAffinityConfig": null
+          }
+        }'
+    fi
+    
+    echo "=== Configuration Applied Successfully ==="
+    echo
+    echo "To test the load balancing:"
+    echo "kubectl exec -n $NAMESPACE deployment/generate-response-monitor -- python /config/test_load_distribution.py"
+    echo
+    echo "To run performance comparison:"
+    echo "kubectl exec -n $NAMESPACE deployment/generate-response-monitor -- python /config/benchmark_concurrent_load.py"
+    echo
+    echo "To rollback if needed:"
+    echo "kubectl apply -f /tmp/ray-deepseek-serve-backup.yaml"

@@ -1,0 +1,299 @@
+# Generate Response System - 실전 튜닝 설정들
+# sessionAffinity 최적화 및 래더 테스트용 ConfigMap들
+
+---
+# 기본 설정 (sessionAffinity 비활성화)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: generate-response-config-baseline
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    config-type: baseline
+data:
+  MODEL_NAME: "deepseek-ai/DeepSeek-V3.1"
+  SERVER_URL: "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+  MAX_CONCURRENT: "32"  # 래더 테스트 시작점
+  TIMEOUT_S: "300.0"
+  MAX_RETRIES: "5"
+  REQUEST_DIR: "/data/data_team/request"
+  PROCESSING_DIR: "/data/data_team/processing"
+  DONE_DIR: "/data/data_team/done"
+  LOG_LEVEL: "INFO"
+  
+  # 분산 처리 설정
+  TOTAL_PODS: "3"
+  ENABLE_DISTRIBUTED: "true"
+
+---
+# 래더 테스트 1단계: 40 동시 요청
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: generate-response-config-step1
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    config-type: ladder-test
+    step: "1"
+data:
+  MODEL_NAME: "deepseek-ai/DeepSeek-V3.1"
+  SERVER_URL: "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+  MAX_CONCURRENT: "40"
+  TIMEOUT_S: "300.0"
+  MAX_RETRIES: "5"
+  REQUEST_DIR: "/data/data_team/request"
+  PROCESSING_DIR: "/data/data_team/processing"
+  DONE_DIR: "/data/data_team/done"
+  LOG_LEVEL: "INFO"
+  TOTAL_PODS: "3"
+  ENABLE_DISTRIBUTED: "true"
+
+---
+# 래더 테스트 2단계: 48 동시 요청
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: generate-response-config-step2
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    config-type: ladder-test
+    step: "2"
+data:
+  MODEL_NAME: "deepseek-ai/DeepSeek-V3.1"
+  SERVER_URL: "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+  MAX_CONCURRENT: "48"
+  TIMEOUT_S: "300.0"
+  MAX_RETRIES: "5"
+  REQUEST_DIR: "/data/data_team/request"
+  PROCESSING_DIR: "/data/data_team/processing"
+  DONE_DIR: "/data/data_team/done"
+  LOG_LEVEL: "INFO"
+  TOTAL_PODS: "3"
+  ENABLE_DISTRIBUTED: "true"
+
+---
+# 래더 테스트 3단계: 64 동시 요청
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: generate-response-config-step3
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    config-type: ladder-test
+    step: "3"
+data:
+  MODEL_NAME: "deepseek-ai/DeepSeek-V3.1"
+  SERVER_URL: "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+  MAX_CONCURRENT: "64"
+  TIMEOUT_S: "300.0"
+  MAX_RETRIES: "5"
+  REQUEST_DIR: "/data/data_team/request"
+  PROCESSING_DIR: "/data/data_team/processing"
+  DONE_DIR: "/data/data_team/done"
+  LOG_LEVEL: "INFO"
+  TOTAL_PODS: "3"
+  ENABLE_DISTRIBUTED: "true"
+
+---
+# 래더 테스트 4단계: 80 동시 요청
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: generate-response-config-step4
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    config-type: ladder-test
+    step: "4"
+data:
+  MODEL_NAME: "deepseek-ai/DeepSeek-V3.1"
+  SERVER_URL: "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+  MAX_CONCURRENT: "80"
+  TIMEOUT_S: "300.0"
+  MAX_RETRIES: "5"
+  REQUEST_DIR: "/data/data_team/request"
+  PROCESSING_DIR: "/data/data_team/processing"
+  DONE_DIR: "/data/data_team/done"
+  LOG_LEVEL: "INFO"
+  TOTAL_PODS: "3"
+  ENABLE_DISTRIBUTED: "true"
+
+---
+# 모니터링 및 메트릭 수집용 스크립트
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: generate-response-monitoring
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    component: monitoring
+data:
+  monitor_performance.py: |
+    #!/usr/bin/env python3
+    """
+    Generate Response 성능 모니터링 스크립트
+    p50/p95 응답지연, 에러율, GPU 사용률 등을 측정
+    """
+    import asyncio
+    import aiohttp
+    import time
+    import statistics
+    from typing import List, Dict, Any
+    
+    class PerformanceMonitor:
+        def __init__(self, server_url: str):
+            self.server_url = server_url
+            self.response_times: List[float] = []
+            self.errors: List[str] = []
+            
+        async def measure_response_time(self, session: aiohttp.ClientSession) -> float:
+            start_time = time.time()
+            try:
+                async with session.get(f"{self.server_url}/v1/models", timeout=10) as response:
+                    await response.text()
+                    if response.status != 200:
+                        self.errors.append(f"HTTP {response.status}")
+                    return time.time() - start_time
+            except Exception as e:
+                self.errors.append(str(e))
+                return time.time() - start_time
+        
+        async def run_test(self, duration_seconds: int = 180):
+            """3분간 성능 테스트 실행"""
+            print(f"Starting {duration_seconds}s performance test...")
+            
+            async with aiohttp.ClientSession() as session:
+                end_time = time.time() + duration_seconds
+                
+                while time.time() < end_time:
+                    response_time = await self.measure_response_time(session)
+                    self.response_times.append(response_time)
+                    await asyncio.sleep(1)  # 1초마다 요청
+            
+            self.print_results()
+        
+        def print_results(self):
+            if not self.response_times:
+                print("No response times recorded")
+                return
+            
+            p50 = statistics.median(self.response_times) * 1000  # ms
+            p95 = statistics.quantiles(self.response_times, n=20)[18] * 1000  # 95th percentile
+            error_rate = len(self.errors) / len(self.response_times) * 100
+            
+            print(f"=== Performance Results ===")
+            print(f"Total requests: {len(self.response_times)}")
+            print(f"P50 response time: {p50:.1f}ms")
+            print(f"P95 response time: {p95:.1f}ms")
+            print(f"Error rate: {error_rate:.1f}%")
+            print(f"Errors: {len(self.errors)}")
+            
+            if self.errors:
+                print(f"Error samples: {self.errors[:5]}")
+    
+    if __name__ == "__main__":
+        import sys
+        server_url = sys.argv[1] if len(sys.argv) > 1 else "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+        duration = int(sys.argv[2]) if len(sys.argv) > 2 else 180
+        
+        monitor = PerformanceMonitor(server_url)
+        asyncio.run(monitor.run_test(duration))
+  
+  check_vllm_metrics.sh: |
+    #!/bin/bash
+    # vLLM 메트릭 확인 스크립트
+    
+    SERVER_URL="${1:-http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000}"
+    
+    echo "=== vLLM Metrics Check ==="
+    echo "Server: $SERVER_URL"
+    echo
+    
+    # /metrics 엔드포인트에서 메트릭 수집
+    if curl -s "$SERVER_URL/metrics" > /tmp/vllm_metrics.txt; then
+        echo "✓ Metrics endpoint accessible"
+        
+        # 주요 메트릭 추출
+        echo "=== Key Metrics ==="
+        
+        # Inflight requests
+        inflight=$(grep "vllm:num_requests_running" /tmp/vllm_metrics.txt | tail -1 | awk '{print $2}')
+        echo "Inflight requests: ${inflight:-N/A}"
+        
+        # Queued requests  
+        queued=$(grep "vllm:num_requests_waiting" /tmp/vllm_metrics.txt | tail -1 | awk '{print $2}')
+        echo "Queued requests: ${queued:-N/A}"
+        
+        # GPU utilization (if available)
+        gpu_util=$(grep "vllm:gpu_cache_usage_perc" /tmp/vllm_metrics.txt | tail -1 | awk '{print $2}')
+        echo "GPU cache usage: ${gpu_util:-N/A}%"
+        
+        # Queue time
+        queue_time=$(grep "vllm:time_to_first_token_seconds" /tmp/vllm_metrics.txt | grep "quantile=\"0.95\"" | awk '{print $2}')
+        echo "P95 queue time: ${queue_time:-N/A}s"
+        
+        if [ -n "$queue_time" ] && [ $(echo "$queue_time > 0.2" | bc -l) -eq 1 ]; then
+            echo "⚠️  WARNING: Queue time > 200ms, consider reducing load"
+        fi
+        
+    else
+        echo "✗ Failed to access metrics endpoint"
+    fi
+    
+    rm -f /tmp/vllm_metrics.txt
+  
+  ladder_test.sh: |
+    #!/bin/bash
+    # 래더 테스트 자동화 스크립트
+    
+    NAMESPACE="p-ncai-wbl"
+    DEPLOYMENT="generate-response-monitor"
+    
+    echo "=== Generate Response Ladder Test ==="
+    
+    for step in 1 2 3 4; do
+        echo
+        echo "=== Step $step: Starting test ==="
+        
+        # ConfigMap 교체
+        kubectl patch deployment $DEPLOYMENT -n $NAMESPACE -p '{
+          "spec": {
+            "template": {
+              "spec": {
+                "containers": [{
+                  "name": "generate-response",
+                  "envFrom": [{
+                    "configMapRef": {
+                      "name": "generate-response-config-step'$step'"
+                    }
+                  }]
+                }]
+              }
+            }
+          }
+        }'
+        
+        # 재시작 대기
+        kubectl rollout status deployment/$DEPLOYMENT -n $NAMESPACE --timeout=300s
+        
+        echo "Step $step deployed, running for 3 minutes..."
+        sleep 180
+        
+        # 성능 측정
+        echo "Measuring performance..."
+        kubectl exec -n $NAMESPACE deployment/$DEPLOYMENT -- python /config/monitor_performance.py
+        
+        # vLLM 메트릭 확인
+        kubectl exec -n $NAMESPACE deployment/$DEPLOYMENT -- bash /config/check_vllm_metrics.sh
+        
+        echo "Step $step completed"
+        echo "Press Enter to continue to next step, or Ctrl+C to stop"
+        read
+    done
+    
+    echo "=== Ladder test completed ==="

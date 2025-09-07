@@ -1,0 +1,1076 @@
+# DeepSeek V3.1 Ray Serve Deployment - Enhanced with IB/RDMA & State Tracking
+# 기존 ray head/worker와 호환되는 serve 전용 deployment
+# 기존 ray-ku-junyoung 클러스터를 사용하여 DeepSeek serving만 담당
+# IB/RDMA 최적화 및 Ray Serve 상태 추적 강화
+
+---
+# Service for DeepSeek HTTP Serving
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-deepseek-serve
+  namespace: p-ncai-wbl
+  labels:
+    app: ray-deepseek-serve
+    ray-cluster: ray-ku-junyoung  # 기존 클러스터 이름 사용
+    component: ray-serve
+    version: enhanced
+  annotations:
+    service.kubernetes.io/topology-mode: "auto"
+    # service.kubernetes.io/topology-aware-hints: "auto"
+spec:
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [ IPv4 ]
+  selector:
+    app: ray-ku-junyoung-head
+    ray-cluster: ray-ku-junyoung
+  sessionAffinity: None
+  # sessionAffinityConfig 제거 - 단일 클라이언트에서 모든 레플리카로 분산 라우팅
+  # 내부 트래픽 정책 (같은 노드 우선)
+  # internalTrafficPolicy: Local
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    appProtocol: http
+
+---
+# DeepSeek Serving Deployment (기존 ray 클러스터 사용)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-deepseek-serve
+  namespace: p-ncai-wbl
+  labels:
+    app: ray-deepseek-serve
+    ray-cluster: ray-ku-junyoung
+    component: ray-serve
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # 다중 serving 인스턴스 방지
+  selector:
+    matchLabels:
+      app: ray-deepseek-serve
+  template:
+    metadata:
+      labels:
+        app: ray-deepseek-serve
+        ray-cluster: ray-ku-junyoung  # 기존 클러스터 이름 사용
+        component: ray-serve
+      annotations:
+        sidecar.istio.io/inject: "false"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 300
+      enableServiceLinks: false
+      dnsConfig:
+        options:
+        - name: ndots
+          value: "1"
+        - name: single-request-reopen
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 500
+        runAsGroup: 500
+        fsGroup: 500
+        fsGroupChangePolicy: "OnRootMismatch"
+
+      nodeSelector:
+        mlx.navercorp.com/zone: h100-i001v8
+
+      # 통신 안정성을 위한 Pod 배치 최적화
+      affinity:
+        # 기존 Ray 클러스터와 같은 노드에 배치하여 통신 지연 최소화
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: ray-cluster
+                  operator: In
+                  values: ["ray-ku-junyoung"]
+              topologyKey: "kubernetes.io/hostname"
+        # 동일한 serve pod끼리는 분산 배치 (단일 장애점 방지)
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["ray-deepseek-serve"]
+              topologyKey: "kubernetes.io/hostname"
+
+      # Pod 분산 배치 제약 (안정성 향상)
+      topologySpreadConstraints:
+      - maxSkew: 2
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: ray-deepseek-serve
+
+      volumes:
+      - name: nlpai-data  # 기존 PVC 이름 사용
+        persistentVolumeClaim:
+          claimName: nlpai-storage
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+
+      containers:
+      - name: ray-deepseek-serve
+        image: sjysjy/ray_serving:1.015
+        imagePullPolicy: IfNotPresent
+
+        env:
+        # Ray 연결 (기존 클러스터)
+        - name: RAY_ADDRESS
+          value: "ray://ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:10001"
+        - { name: RAY_CLIENT_ADDRESS, value: "ray://ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:10001" }
+        - { name: RAY_GCS_ADDRESS,    value: "ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:6379" }
+        - { name: RAY_DASHBOARD,      value: "http://ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:8265" }
+        - { name: RAY_NAMESPACE, value: "serve" }
+        - { name: RAY_BACKEND_LOG_LEVEL, value: "debug" }
+        - { name: RAY_VERBOSE, value: "1" }
+
+        # (중요) 자식 태스크의 PG 캡쳐 비활성화 → PG 해제 교착 줄임
+        - { name: RAY_PLACEMENT_GROUP_CAPTURE_CHILD_TASKS, value: "0" }
+
+        # Ray Serve 상태 추적 및 안정성 강화
+        - { name: RAY_SERVE_DEPLOYMENT_STARTUP_GRACE_PERIOD_S, value: "3600" }   # 45m
+        - { name: RAY_SERVE_ENABLE_EXPERIMENTAL_STREAMING, value: "1" }
+
+        # 요청/프록시 타임아웃: 외부 LB/Ingress 타임아웃과 반드시 정합 확인!
+        - { name: RAY_SERVE_REQUEST_PROCESSING_TIMEOUT_S, value: "1200" }         # 20m
+        - { name: RAY_SERVE_PROXY_TIMEOUT_S, value: "1200" }                       # 15m
+
+        # 컨트롤 플레인/헬스체크: 감지 늦어지지 않도록 과도 확장은 지양
+        - { name: RAY_SERVE_CONTROLLER_MAX_CONCURRENT_QUERIES, value: "1000" }   # 그대로 유지 권장
+        - { name: RAY_SERVE_CONTROLLER_HEARTBEAT_TIMEOUT_S, value: "300" }       # 5m
+        - { name: RAY_SERVE_REPLICA_HEALTH_CHECK_PERIOD_S, value: "20" }         # 20s (오버헤드 완화)
+        - { name: RAY_SERVE_REPLICA_HEALTH_CHECK_TIMEOUT_S, value: "1200" }       # 20m (GC/일시멈춤 관대)
+
+        # Ray Client 세션 안정성
+        - { name: RAY_CLIENT_RECONNECT_GRACE_PERIOD_S, value: "3600" }           # 30m
+        - { name: RAY_CLIENT_SERVER_KEEPALIVE_TIMEOUT_S, value: "420" }          # 7m
+
+        # 관측
+        - { name: RAY_SERVE_ENABLE_TASK_EVENTS, value: "1" }
+
+
+        # DeepSeek 모델 설정 (TP=16, PP=2 최적화)
+        - { name: MODEL_NAME, value: "deepseek-ai/DeepSeek-V3.1" }
+        - { name: MAX_MODEL_LEN, value: "32768" }
+        - { name: TENSOR_PARALLEL_SIZE, value: "8" }    # 16 GPU per replica
+        - { name: PIPELINE_PARALLEL_SIZE, value: "2" }   # 2-stage pipeline
+        - { name: GPU_MEMORY_UTILIZATION, value: "0.85" } # 여유 확보
+        - { name: NUM_REPLICAS, value: "32" }             # 최적 replica 수
+        - { name: SERVING_PORT, value: "8000" }
+        - { name: MAX_NUM_SEQS, value: "32" }            # 무거운 모델 고려
+        - { name: DTYPE, value: "bfloat16" }
+
+        # HuggingFace 캐시 (기존 설정과 동일)
+        - { name: HF_HOME, value: "/data/data_team/cache/huggingface" }
+        - { name: HF_HUB_CACHE, value: "/data/data_team/cache/huggingface" }
+        - { name: TRANSFORMERS_CACHE, value: "/data/data_team/cache/huggingface/transformers" }
+        - { name: HF_DATASETS_CACHE, value: "/data/data_team/cache/huggingface/datasets" }
+        - { name: VLLM_DOWNLOAD_DIR, value: "/data/data_team/cache/huggingface" }
+        - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+        - { name: VLLM_USE_V1, value: "1" }
+
+        # IB/RDMA 최적화 설정 (기존 head/worker와 완전 호환)
+        - { name: RDMAV_FORK_SAFE, value: "1" }
+        - { name: NCCL_IB_DISABLE, value: "0" }           # RDMA 사용
+        - { name: NCCL_NET_GDR_LEVEL, value: "2" }        # GPUDirect RDMA 선호
+        # 기존 head/worker와 동일한 설정 유지 (주석처리된 고급 설정들)
+        # - { name: NCCL_IB_HCA, value: "mlx5_0,mlx5_1" }
+        # - { name: NCCL_IB_GID_INDEX, value: "3" }
+        # - { name: NCCL_IB_QPS_PER_CONNECTION, value: "4" }
+        # - { name: NCCL_IB_TIMEOUT, value: "22" }
+        # - { name: NCCL_IB_RETRY_CNT, value: "7" }
+
+        # 통신 안정성 강화 (기존 설정과 호환)
+        - { name: NCCL_SOCKET_IFNAME, value: "eth0" }     # TCP fallback
+        - { name: GLOO_SOCKET_IFNAME, value: "eth0" }
+        - { name: NCCL_SOCKET_FAMILY, value: "AF_INET" }
+        - { name: NCCL_DEBUG, value: "INFO" }
+        - { name: NCCL_DEBUG_SUBSYS, value: "INIT,NET" }
+        - { name: TORCH_NCCL_BLOCKING_WAIT, value: "1" }
+        - { name: NCCL_ASYNC_ERROR_HANDLING, value: "1" }
+        - { name: GLOO_USE_LIBUV, value: "0" }
+        - { name: GLOO_USE_IPV6, value: "0" }
+        - { name: TP_USE_IPV6, value: "0" }
+        - { name: TF_ENABLE_ONEDNN_OPTS, value: "0" }
+        - { name: NUMEXPR_MAX_THREADS, value: "64" }
+        - { name: NO_PROXY, value: "localhost,127.0.0.1,.svc,.cluster.local" }
+
+        # 추가 통신 안정성 설정 (NUM_REPLICAS=10 고려)
+        - { name: NCCL_SOCKET_NTHREADS, value: "4" }      # 소켓 스레드 증가
+        - { name: NCCL_NSOCKS_PERTHREAD, value: "2" }     # 스레드당 소켓 수
+        - { name: NCCL_BUFFSIZE, value: "8388608" }       # 8MB 버퍼 (대용량 통신)
+        - { name: NCCL_P2P_NET_CHUNKSIZE, value: "524288" } # 512KB P2P 청크
+        - { name: NCCL_CROSS_NIC, value: "1" }            # 크로스 NIC 통신 허용
+        - { name: NCCL_ALGO, value: "Tree,Ring" }          # 안정적인 알고리즘 우선
+
+        # Ray 통신 안정성
+        - { name: RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER, value: "0" }
+        - { name: RAY_DISABLE_IMPORT_WARNING, value: "1" }
+        - { name: RAY_DEDUP_LOGS, value: "0" }             # 로그 중복 제거 비활성화 (디버깅용)
+        - { name: RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE, value: "1" }
+
+        # HTTP/네트워크 연결 안정성
+        - { name: PYTHONUNBUFFERED, value: "1" }
+        - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+        - { name: MALLOC_TRIM_THRESHOLD_, value: "0" }     # 메모리 단편화 방지
+
+        volumeMounts:
+        - { name: nlpai-data, mountPath: /data }
+        - { name: dshm, mountPath: /dev/shm }
+
+        securityContext:
+          capabilities:
+            add: ["IPC_LOCK"]
+
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -e
+          echo "=== DeepSeek Ray Serve Startup ==="
+
+          # 시스템 리소스 최적화
+          ulimit -n 1048576 || true    # 파일 디스크립터 증가
+          ulimit -l unlimited || true  # 메모리 락 제한 해제
+          ulimit -c unlimited || true  # 코어 덤프 크기 무제한
+
+          # 네트워크 연결성 사전 체크
+          echo "=== Network Connectivity Check ==="
+          RAY_HEAD="ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local"
+
+          # DNS 해석 확인
+          getent hosts ${RAY_HEAD} || echo "DNS resolution warning"
+
+          # Ray Head 연결성 확인
+          for i in {1..60}; do
+            if nc -z ${RAY_HEAD} 10001; then
+              echo "✓ Ray Head connection verified"
+              break
+            fi
+            echo "Waiting for Ray Head connection... (attempt $i/60)"
+            sleep 5
+          done
+
+          # IB/RDMA 상태 확인 (initContainer 대신 여기서 체크)
+          echo "=== IB/RDMA Status Check ==="
+          if [ -d /sys/class/infiniband ] && [ "$(ls -A /sys/class/infiniband)" ]; then
+            echo "✓ IB devices available: $(ls /sys/class/infiniband)"
+            for hca in $(ls /sys/class/infiniband); do
+              if [ -f "/sys/class/infiniband/$hca/ports/1/state" ]; then
+                state=$(cat /sys/class/infiniband/$hca/ports/1/state)
+                echo "  $hca port 1 state: $state"
+                if [ "$state" = "4: ACTIVE" ]; then
+                  echo "  ✓ $hca is ACTIVE"
+                else
+                  echo "  ! $hca state: $state (not ACTIVE)"
+                fi
+              fi
+            done
+            echo "✓ IB/RDMA will be used for communication"
+          else
+            echo "! No IB devices found, using TCP fallback"
+            echo "! Setting NCCL_IB_DISABLE=1 for this container"
+            export NCCL_IB_DISABLE=1
+          fi
+
+          # 메모리 상태 확인
+          echo "=== Memory Status ==="
+          free -h
+          echo "Available memory: $(free -m | awk 'NR==2{printf "%.1fGB", $7/1024}')"
+
+          # Ray Serve 시작
+          echo "=== Starting Ray Serve ==="
+          cd /opt/WBL/DATA/serving
+
+          # 환경변수 검증
+          echo "Model: ${MODEL_NAME}"
+          echo "Replicas: ${NUM_REPLICAS}"
+          echo "TP Size: ${TENSOR_PARALLEL_SIZE}"
+          echo "PP Size: ${PIPELINE_PARALLEL_SIZE}"
+
+          exec python3 serve_head_api.py \
+            --model_name=${MODEL_NAME} \
+            --max_model_len=${MAX_MODEL_LEN} \
+            --tensor_parallel_size=${TENSOR_PARALLEL_SIZE} \
+            --pipeline_parallel_size=${PIPELINE_PARALLEL_SIZE} \
+            --gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
+            --num_replicas=${NUM_REPLICAS} \
+            --serving_port=${SERVING_PORT} \
+            --max_num_seqs=${MAX_NUM_SEQS} \
+            --dtype=${DTYPE}
+
+        ports:
+        - { containerPort: 8000, name: http }
+
+        # 무거운 모델: 시작은 HTTP 프록시가 응답해야 '성공'으로 간주
+        startupProbe:
+          exec:
+            command:
+              - /bin/bash
+              - -lc
+              - |
+                curl -sSf --connect-timeout 5 --max-time 25 \
+                  http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000/v1/models >/dev/null
+          initialDelaySeconds: 180
+          periodSeconds: 30
+          timeoutSeconds: 60
+          failureThreshold: 120  # 최대 ~60분까지 대기
+
+        # 컨트롤러 Pod는 트래픽을 직접 받지 않으므로,
+        # '준비됨'은 Ray Client 접속 + 자기 프로세스가 살아있는지만 보면 충분
+        readinessProbe:
+          exec:
+            command:
+              - /bin/bash
+              - -lc
+              - |
+                set -e
+                pgrep -f 'serve_head_api.py' >/dev/null
+                nc -z ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local 10001
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+          successThreshold: 1
+
+        # 라이브니스는 '자기 생명'만 본다. 원격 HTTP 프록시 불안정으로 재시작하지 않도록.
+        livenessProbe:
+          exec:
+            command:
+              - /bin/bash
+              - -lc
+              - |
+                pgrep -f 'serve_head_api.py' >/dev/null
+          initialDelaySeconds: 0        # startupProbe 성공 전에는 자동 비활성화됨
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 10          # ~5분 유예
+
+        lifecycle:
+          preStop:
+            exec:
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  echo '=== Graceful Shutdown Started ==='
+                  python3 - <<'PY'
+                  import os, time, ray
+                  from ray import serve
+                  addr = os.getenv("RAY_CLIENT_ADDRESS")
+                  ns   = os.getenv("RAY_NAMESPACE", "serve")  # 기본값을 실제와 일치
+                  try:
+                      ray.init(address=addr, namespace=ns, ignore_reinit_error=True)
+                      try:
+                          serve.shutdown()
+                          print("serve.shutdown() called")
+                      except Exception as e:
+                          print("serve.shutdown() failed:", e)
+                  finally:
+                      time.sleep(10)  # 컨트롤 플레인 정리 유예
+                  PY
+                  echo '=== Graceful Shutdown Completed ==='
+
+
+        resources:
+          limits:
+            cpu: "16"              # CPU 증가 (NUM_REPLICAS=10)
+            memory: "128Gi"        # 메모리 증가 (안정성)
+            ephemeral-storage: "50Gi"  # 임시 저장소 제한
+          requests:
+            cpu: "12"              # 최소 보장 CPU
+            memory: "96Gi"         # 최소 보장 메모리
+            ephemeral-storage: "30Gi"
+
+---
+# PodDisruptionBudget for DeepSeek Serve
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ray-deepseek-serve-pdb
+  namespace: p-ncai-wbl
+spec:
+  maxUnavailable: 0  # serving 중단 방지
+  selector:
+    matchLabels:
+      app: ray-deepseek-serve
+
+# ServiceMonitor 제거 - 권한 문제로 인해 주석 처리
+# Prometheus Operator가 설치되고 권한이 있는 경우에만 사용
+# ---
+# apiVersion: monitoring.coreos.com/v1
+# kind: ServiceMonitor
+# metadata:
+#   name: ray-deepseek-serve-monitor
+#   namespace: p-ncai-wbl
+#   labels:
+#     app: ray-deepseek-serve
+#     component: ray-serve
+# spec:
+#   selector:
+#     matchLabels:
+#       app: ray-deepseek-serve
+#   endpoints:
+#   - port: metrics
+#     interval: 30s
+#     path: /metrics
+
+---
+# ConfigMap for DeepSeek serving monitoring and state tracking
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-deepseek-serve-monitoring
+  namespace: p-ncai-wbl
+  labels:
+    app: ray-deepseek-serve
+    component: monitoring
+data:
+  check-serve.sh: |
+    #!/bin/bash
+    # Enhanced DeepSeek Serve 상태 확인 스크립트
+    RAY_ADDRESS="http://ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:8265"
+    SERVE_URL="http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+
+    echo "=== Ray Cluster Status ==="
+    ray status --address=${RAY_ADDRESS}
+
+    echo "=== Ray Serve Status ==="
+    ray serve status --address=${RAY_ADDRESS}
+
+    echo "=== Ray Serve Config ==="
+    ray serve config --address=${RAY_ADDRESS}
+
+    echo "=== DeepSeek Serve Health Check ==="
+    curl -s ${SERVE_URL}/v1/models | jq . || echo "Health check failed"
+
+    echo "=== GPU Usage ==="
+    ray status --address=${RAY_ADDRESS} | grep -A 10 "Resources"
+
+    echo "=== IB/RDMA Status ==="
+    if [ -d /sys/class/infiniband ]; then
+      echo "IB devices: $(ls /sys/class/infiniband)"
+      for hca in $(ls /sys/class/infiniband); do
+        if [ -f "/sys/class/infiniband/$hca/ports/1/state" ]; then
+          state=$(cat /sys/class/infiniband/$hca/ports/1/state)
+          echo "$hca port 1 state: $state"
+        fi
+      done
+    else
+      echo "No IB devices found"
+    fi
+
+    echo "=== Network Connectivity Test ==="
+    RAY_HEAD="ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local"
+
+    # DNS 해석 테스트
+    echo "DNS resolution test:"
+    getent hosts ${RAY_HEAD} || echo "DNS resolution failed"
+
+    # 연결성 테스트
+    echo "Connection tests:"
+    nc -z ${RAY_HEAD} 8265 && echo "✓ Dashboard port (8265) reachable" || echo "✗ Dashboard port unreachable"
+    nc -z ${RAY_HEAD} 10001 && echo "✓ Client port (10001) reachable" || echo "✗ Client port unreachable"
+
+    # Ping 테스트
+    ping -c 3 ${RAY_HEAD} && echo "✓ Ping successful" || echo "✗ Ping failed"
+
+    echo "=== Pod Communication Health ==="
+    # 같은 네임스페이스 내 다른 서비스 연결성
+    kubectl get pods -n p-ncai-wbl -l ray-cluster=ray-ku-junyoung --no-headers | wc -l | xargs echo "Ray cluster pods count:"
+
+    # 현재 Pod의 네트워크 상태
+    echo "Current pod network interfaces:"
+    ip addr show eth0 2>/dev/null || echo "eth0 interface not found"
+
+  test-inference.py: |
+    #!/usr/bin/env python3
+    """
+    Enhanced DeepSeek 추론 테스트 스크립트 with state tracking
+    """
+    import requests
+    import time
+    import json
+    import sys
+    from datetime import datetime
+
+    def test_deepseek_inference():
+        serve_url = "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+
+        # 모델 상태 확인
+        try:
+            models_response = requests.get(f"{serve_url}/v1/models", timeout=10)
+            if models_response.status_code == 200:
+                models = models_response.json()
+                print(f"✓ Available models: {[m['id'] for m in models['data']]}")
+            else:
+                print(f"✗ Models endpoint failed: HTTP {models_response.status_code}")
+                return False
+        except Exception as e:
+            print(f"✗ Models endpoint error: {e}")
+            return False
+
+        # 간단한 추론 테스트
+        payload = {
+            "model": "deepseek-ai/DeepSeek-V3.1",
+            "messages": [
+                {"role": "user", "content": "안녕하세요. 간단한 수학 문제를 풀어주세요: 2+3=?"}
+            ],
+            "max_tokens": 100,
+            "temperature": 0.1
+        }
+
+        try:
+            print(f"DeepSeek 추론 테스트 시작... [{datetime.now()}]")
+            start_time = time.time()
+
+            response = requests.post(
+                f"{serve_url}/v1/chat/completions",
+                json=payload,
+                timeout=60
+            )
+
+            end_time = time.time()
+            latency = end_time - start_time
+
+            if response.status_code == 200:
+                result = response.json()
+                content = result['choices'][0]['message']['content']
+                usage = result.get('usage', {})
+
+                print(f"✓ 추론 성공 (소요시간: {latency:.2f}초)")
+                print(f"응답: {content}")
+                print(f"토큰 사용량: {usage}")
+
+                # 성능 메트릭 로깅
+                if latency > 30:
+                    print(f"⚠ 높은 지연시간 감지: {latency:.2f}초")
+
+                return True
+            else:
+                print(f"✗ 추론 실패: HTTP {response.status_code}")
+                print(f"응답: {response.text}")
+                return False
+
+        except requests.exceptions.Timeout:
+            print("✗ 추론 테스트 타임아웃 (60초)")
+            return False
+        except Exception as e:
+            print(f"✗ 추론 테스트 오류: {e}")
+            return False
+
+    def test_concurrent_requests(num_requests=5):
+        """동시 요청 테스트"""
+        import concurrent.futures
+        import threading
+
+        print(f"\n=== 동시 요청 테스트 ({num_requests}개) ===")
+
+        def single_request(req_id):
+            serve_url = "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+            payload = {
+                "model": "deepseek-ai/DeepSeek-V3.1",
+                "messages": [
+                    {"role": "user", "content": f"Request {req_id}: What is 5*{req_id}?"}
+                ],
+                "max_tokens": 50,
+                "temperature": 0.1
+            }
+
+            try:
+                start_time = time.time()
+                response = requests.post(
+                    f"{serve_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=60
+                )
+                end_time = time.time()
+
+                if response.status_code == 200:
+                    return {"id": req_id, "success": True, "latency": end_time - start_time}
+                else:
+                    return {"id": req_id, "success": False, "error": f"HTTP {response.status_code}"}
+            except Exception as e:
+                return {"id": req_id, "success": False, "error": str(e)}
+
+        start_time = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_requests) as executor:
+            futures = [executor.submit(single_request, i) for i in range(num_requests)]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+        total_time = time.time() - start_time
+        successful = [r for r in results if r["success"]]
+        failed = [r for r in results if not r["success"]]
+
+        print(f"총 소요시간: {total_time:.2f}초")
+        print(f"성공: {len(successful)}/{num_requests}")
+        print(f"실패: {len(failed)}/{num_requests}")
+
+        if successful:
+            avg_latency = sum(r["latency"] for r in successful) / len(successful)
+            print(f"평균 지연시간: {avg_latency:.2f}초")
+
+        if failed:
+            print("실패한 요청들:")
+            for f in failed:
+                print(f"  Request {f['id']}: {f['error']}")
+
+        return len(successful) == num_requests
+
+    if __name__ == "__main__":
+        success = test_deepseek_inference()
+        if success and len(sys.argv) > 1 and sys.argv[1] == "--concurrent":
+            concurrent_success = test_concurrent_requests()
+            success = success and concurrent_success
+
+        sys.exit(0 if success else 1)
+
+  monitor-serve.py: |
+    #!/usr/bin/env python3
+    """
+    Ray Serve 상태 모니터링 스크립트
+    """
+    import ray
+    import time
+    import json
+    from datetime import datetime
+
+    def monitor_ray_serve():
+        ray_address = "ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:10001"
+
+        try:
+            # Ray 클러스터 연결
+            ray.init(address=f"ray://{ray_address}", ignore_reinit_error=True)
+
+            print(f"=== Ray Serve 모니터링 시작 [{datetime.now()}] ===")
+
+            # Ray Serve 상태 확인
+            from ray import serve
+
+            try:
+                serve_status = serve.status()
+                print(f"Ray Serve 상태: {serve_status}")
+
+                # 배포된 애플리케이션 정보
+                applications = serve_status.applications
+                for app_name, app_status in applications.items():
+                    print(f"\n애플리케이션: {app_name}")
+                    print(f"  상태: {app_status.status}")
+                    print(f"  메시지: {app_status.message}")
+
+                    # 배포 상태
+                    for deployment_name, deployment_status in app_status.deployments.items():
+                        print(f"  배포 {deployment_name}:")
+                        print(f"    상태: {deployment_status.status}")
+                        print(f"    복제본: {deployment_status.replica_states}")
+
+            except Exception as e:
+                print(f"Ray Serve 상태 확인 실패: {e}")
+
+            # 클러스터 리소스 상태
+            cluster_resources = ray.cluster_resources()
+            print(f"\n클러스터 리소스:")
+            for resource, amount in cluster_resources.items():
+                print(f"  {resource}: {amount}")
+
+            # 노드 상태
+            nodes = ray.nodes()
+            print(f"\n노드 상태 ({len(nodes)}개 노드):")
+            for node in nodes:
+                print(f"  노드 {node['NodeID'][:8]}:")
+                print(f"    상태: {'Alive' if node['Alive'] else 'Dead'}")
+                print(f"    리소스: {node['Resources']}")
+
+        except Exception as e:
+            print(f"Ray 클러스터 연결 실패: {e}")
+            return False
+
+        finally:
+            try:
+                ray.shutdown()
+            except:
+                pass
+
+        return True
+
+    if __name__ == "__main__":
+        import sys
+        success = monitor_ray_serve()
+        sys.exit(0 if success else 1)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-ghost-pg-guard
+  namespace: p-ncai-wbl
+data:
+  ghost_pg_guard.py: |
+    import os, sys, time, json, subprocess
+    import ray
+
+    # ---------- 설정 ----------
+    RAY_ADDR = os.getenv("RAY_CLIENT_ADDRESS", "ray://ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:10001")
+    NAMESPACE = os.getenv("K8S_NAMESPACE", "p-ncai-wbl")
+    WORKER_LABEL_SELECTOR = os.getenv("WORKER_LABEL_SELECTOR", "app=ray-ku-junyoung-worker")
+    MAX_KILLS = int(os.getenv("MAX_KILLS_PER_RUN", "2"))
+    DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+    TIMEOUT_S = int(os.getenv("STATE_TIMEOUT_S", "30"))
+    ORPHAN_PG_GRACE_S = int(os.getenv("ORPHAN_PG_GRACE_S", "600"))  # 10분
+
+    # ---------- K8s 클라이언트 준비 ----------
+    def ensure_k8s_client():
+        try:
+            import kubernetes  # noqa
+            return True
+        except Exception:
+            try:
+                print("[guard] installing kubernetes python client...", flush=True)
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "kubernetes"], stdout=subprocess.DEVNULL)
+                import kubernetes  # noqa
+                return True
+            except Exception as e:
+                print(f"[guard] kubernetes client not available: {e}")
+                return False
+
+    def get_worker_pods_by_ip(pod_ip_set):
+        """pod_ip → pod_name 매핑(동일 네임스페이스/라벨)"""
+        pods = {}
+        try:
+            from kubernetes import client, config
+            config.load_incluster_config()
+            v1 = client.CoreV1Api()
+            ret = v1.list_namespaced_pod(namespace=NAMESPACE, label_selector=WORKER_LABEL_SELECTOR)
+            for item in ret.items:
+                ip = (item.status.pod_ip or "").strip()
+                if ip in pod_ip_set:
+                    pods[ip] = item.metadata.name
+        except Exception as e:
+            print(f"[guard] K8s list pods failed: {e}")
+        return pods
+
+    def delete_pod(pod_name):
+        try:
+            from kubernetes import client, config
+            config.load_incluster_config()
+            v1 = client.CoreV1Api()
+            # 짧은 grace period로 빠르게 롤링
+            v1.delete_namespaced_pod(pod_name, namespace=NAMESPACE, grace_period_seconds=10)
+            print(f"[guard] deleted pod: {pod_name}")
+            return True
+        except Exception as e:
+            print(f"[guard] delete pod failed: {pod_name}: {e}")
+            return False
+
+    # ---------- Ray 상태 수집 ----------
+    def list_alive_gpu_actors():
+        try:
+            from ray.util.state.api import list_actors
+            acts = list_actors(
+                filters=[("state","=","ALIVE")],
+                detail=True, limit=20000,
+                raise_on_missing_output=False, timeout=TIMEOUT_S
+            )
+            return [a for a in acts if float(a.get("required_resources",{}).get("GPU",0) or 0) > 0.0]
+        except Exception as e:
+            print(f"[guard] list_actors failed: {e}")
+            return []
+
+    def list_gpu_placement_groups():
+        try:
+            from ray.util.state.api import list_placement_groups
+            pgs = list_placement_groups(
+                detail=True, limit=5000,
+                raise_on_missing_output=False, timeout=TIMEOUT_S
+            )
+            out = []
+            for pg in pgs:
+                bundles = pg.get("bundles") or []
+                g = sum(float(b.get("GPU",0) or 0) for b in bundles)
+                if g > 0.0 and pg.get("state") in ("CREATED","PENDING","RESCHEDULING"):
+                    out.append(pg)
+            return out
+        except Exception as e:
+            print(f"[guard] list_placement_groups failed: {e}")
+            return []
+
+    def per_node_gpu_capacity():
+        """노드별 GPU total/available, IP 추출"""
+        nodes = []
+        try:
+            from ray.util.state.api import list_nodes
+            infos = list_nodes(detail=True, limit=5000, raise_on_missing_output=False, timeout=TIMEOUT_S)
+            for n in infos:
+                total = float((n.get("resources_total") or {}).get("GPU", 0) or 0)
+                avail = float((n.get("resources_available") or {}).get("GPU", 0) or 0)
+                if total <= 0:
+                    continue
+                nodes.append({
+                    "node_id": n.get("node_id"),
+                    "ip": n.get("node_ip") or n.get("node_ip_address"),
+                    "name": n.get("node_name"),
+                    "total": total, "avail": avail,
+                    "alive": n.get("state") == "ALIVE"
+                })
+        except Exception as e:
+            print(f"[guard] list_nodes failed: {e}")
+        return nodes
+
+    # --- 추가: 고아 PG(actors=0) 제거 기능 ---
+    def list_alive_actors_in_pg(pg_id, timeout_s):
+        try:
+            from ray.util.state.api import list_actors
+            acts = list_actors(
+                filters=[("placement_group_id","=",pg_id), ("state","=","ALIVE")],
+                detail=False, limit=2000,
+                raise_on_missing_output=False, timeout=timeout_s
+            )
+            return acts or []
+        except Exception as e:
+            print(f"[guard] list actors in PG failed: {pg_id}: {e}")
+            return []
+
+    def remove_pg_by_name(pg_name):
+        try:
+            from ray.util.placement_group import placement_group as pg_handle, remove_placement_group
+            h = pg_handle(name=pg_name)
+            remove_placement_group(h)
+            print(f"[guard] removed PG by name: {pg_name}")
+            return True
+        except Exception as e:
+            print(f"[guard] remove PG failed: {pg_name}: {e}")
+            return False
+
+    def running_job_ids():
+        try:
+            from ray.util.state.api import list_jobs
+            jobs = list_jobs(detail=True, limit=5000, raise_on_missing_output=False, timeout=TIMEOUT_S)
+            return set(j.get("job_id") for j in jobs if j.get("status") in ("RUNNING","PENDING","SUBMITTED"))
+        except Exception as e:
+            print(f"[guard] list_jobs failed: {e}")
+            return set()
+
+    def main():
+        # Ray 연결 (logging_level 문자열 인자 제거: 버전 호환성 ↑)
+        try:
+            ray.init(address=RAY_ADDR, ignore_reinit_error=True)
+        except Exception as e:
+            print(f"[guard] ray.init failed: {e}")
+            return 1
+
+        # 클러스터 단위 상태
+        gpu_actors = list_alive_gpu_actors()
+        gpu_pgs    = list_gpu_placement_groups()
+        nodes      = per_node_gpu_capacity()
+
+        total_gpu_cluster = sum(n["total"] for n in nodes)
+        used_gpu_cluster  = sum(n["total"] - n["avail"] for n in nodes)
+
+        print(json.dumps({
+            "total_gpu": total_gpu_cluster,
+            "used_gpu": used_gpu_cluster,
+            "alive_gpu_actors": len(gpu_actors),
+            "active_gpu_pgs": len(gpu_pgs),
+            "node_count": len(nodes)
+        }, ensure_ascii=False))
+
+        acted = False  # 어떤 조치라도 했으면 True로
+
+        # 1) 우선 고아 PG 정리 시도 (타임스탬프 보수적, 실행 중 잡 보호)
+        orphan_pgs = []
+        now_ts = time.time()
+        running_jobs = running_job_ids()
+
+        for pg in gpu_pgs:
+            pg_id   = pg.get("placement_group_id")
+            pg_name = pg.get("name") or ""
+
+            # 타임스탬프 보수적 처리: 없으면 old_enough=False
+            ts_raw = pg.get("scheduling_state_ts") or pg.get("creation_time_ms")
+            if ts_raw:
+                ts = float(ts_raw)
+                if ts > 1e12:  # ms → s 추정
+                    ts /= 1000.0
+                old_enough = (now_ts - ts) >= ORPHAN_PG_GRACE_S
+            else:
+                old_enough = False
+
+            alive_in_pg = list_alive_actors_in_pg(pg_id, TIMEOUT_S)
+            creator_ok = (pg.get("creator_job_id") not in running_jobs)
+
+            if len(alive_in_pg) == 0 and old_enough and creator_ok:
+                orphan_pgs.append(pg)
+
+        removed = 0
+        for pg in orphan_pgs:
+            name = pg.get("name") or ""
+            # Serve가 만든 PG만 안전하게 제거
+            if name.startswith("SERVE_") and not DRY_RUN:
+                if remove_pg_by_name(name):
+                    removed += 1
+        if removed > 0:
+            acted = True
+
+        # 2) 배우(actors)==0이고, 여전히 GPU 사용이 남으며,
+        #    (PG가 없거나, 남은 PG가 전부 고아)인 경우 → 워커 롤링
+        still_used = any(n["total"] > 0 and (n["avail"] < n["total"] - 1e-6) for n in nodes)
+        actors_zero = (len(gpu_actors) == 0)
+
+        only_orphans = False
+        if len(gpu_pgs) > 0:
+            only_orphans = all(len(list_alive_actors_in_pg(pg.get("placement_group_id"), TIMEOUT_S)) == 0 for pg in gpu_pgs)
+
+        if actors_zero and still_used and (len(gpu_pgs) == 0 or only_orphans):
+            suspects = []
+            actor_nodes = set(a.get("node_id") for a in gpu_actors if a.get("node_id"))
+            for n in nodes:
+                if not n["alive"]:
+                    continue
+                if n["total"] > 0 and (n["avail"] < n["total"] - 1e-6) and (n["node_id"] not in actor_nodes):
+                    suspects.append(n)
+
+            if suspects:
+                ip_set = set(s["ip"] for s in suspects if s["ip"])
+                have_k8s = ensure_k8s_client()
+                pods = get_worker_pods_by_ip(ip_set) if have_k8s else {}
+
+                kills = 0
+                for s in suspects:
+                    ip = s["ip"]; pod = pods.get(ip)
+                    print(f"[guard] suspect node for roll: ip={ip} name={s['name']} total={s['total']} avail={s['avail']} pod={pod}")
+                    if pod and not DRY_RUN and have_k8s:
+                        if kills >= MAX_KILLS:
+                            print("[guard] kill budget reached; stop here.")
+                            break
+                        if delete_pod(pod):
+                            kills += 1
+                    else:
+                        print("[guard] DRY_RUN or missing k8s client/pod mapping; no action taken.")
+                if kills > 0:
+                    acted = True
+                print(f"[guard] orphan_pgs_removed={removed}, pods_deleted={kills}")
+
+        # 조치가 있었다면 여기서 종료 (중복 액션/로그 방지)
+        if acted:
+            return 0
+
+        # 3) 아무 조치도 없었고, 클러스터에 actor/PG가 없는데도 GPU 사용이 남아있다면 알림만
+        if actors_zero and len(gpu_pgs) == 0 and still_used:
+            print("[guard] WARNING: actors=0, pgs=0, but GPUs still used; next run may roll workers.")
+            return 0
+
+        print("[guard] cluster has active GPU actors or non-orphan PGs; skip remediation.")
+        return 0
+
+    if __name__ == "__main__":
+        rc = main()
+        try:
+            ray.shutdown()
+        except:
+            pass
+        sys.exit(rc)
+
+# ---
+# apiVersion: v1
+# kind: ServiceAccount
+# metadata:
+#   name: ray-ghost-pg-guard
+#   namespace: p-ncai-wbl
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: ray-ghost-pg-guard
+#   namespace: p-ncai-wbl
+# rules:
+#   - apiGroups: [""]
+#     resources: ["pods"]
+#     verbs: ["get","list","watch","delete"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: ray-ghost-pg-guard
+#   namespace: p-ncai-wbl
+# subjects:
+#   - kind: ServiceAccount
+#     name: ray-ghost-pg-guard
+#     namespace: p-ncai-wbl
+# roleRef:
+#   kind: Role
+#   name: ray-ghost-pg-guard
+#   apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ray-ghost-pg-guard
+  namespace: p-ncai-wbl
+spec:
+  schedule: "*/7 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          nodeSelector:
+            mlx.navercorp.com/zone: h100-i001v8
+          # (필요 시) GPU 노드 taint가 있을 경우 추가
+          tolerations:
+            - operator: "Exists"
+              effect: "NoSchedule"
+          activeDeadlineSeconds: 180
+          terminationGracePeriodSeconds: 20
+          serviceAccountName: ray-ghost-pg-guard
+          restartPolicy: Never
+          containers:
+            - name: guard
+              image: sjysjy/ray_serving:1.015
+              imagePullPolicy: IfNotPresent
+              env:
+                - { name: PYTHONUNBUFFERED, value: "1" }
+                - { name: RAY_CLIENT_ADDRESS, value: "ray://ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:10001" }
+                - { name: K8S_NAMESPACE, value: "p-ncai-wbl" }
+                - { name: WORKER_LABEL_SELECTOR, value: "app=ray-ku-junyoung-worker" }
+                - { name: MAX_KILLS_PER_RUN, value: "2" }
+                - { name: DRY_RUN, value: "false" }   # 검증 땐 true
+                - { name: STATE_TIMEOUT_S, value: "30" }
+                - { name: ORPHAN_PG_GRACE_S, value: "600" } # 고아 PG로 간주할 유예(예: 10분)
+              command: ["/bin/bash","-lc"]
+              args: ["python3 /scripts/ghost_pg_guard.py"]
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "256Mi"
+                limits:
+                  memory: "512Mi"
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+          volumes:
+            - name: script
+              configMap:
+                name: ray-ghost-pg-guard
+                defaultMode: 0755
+          # Job 객체의 TTL(완료 후 정리)
+          # (cluster에 TTL controller가 켜져 있어야 동작)
+          # ttlSecondsAfterFinished: 300  # ← 이 필드는 Pod spec이 아니라 Job spec에 두는 옵션이라 생략 가능

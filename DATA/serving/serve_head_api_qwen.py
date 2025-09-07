@@ -1,8 +1,6 @@
 # ray head 에서 실행해야 함
 import os
-import sys
 import ray
-import logging
 import argparse
 from pathlib import Path
 from typing import List, Any, Tuple
@@ -16,49 +14,13 @@ from ray.serve.llm import (
     ModelLoadingConfig,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-
-# Ray 연결 - Client 모드 비활성화하고 Worker 모드 강제
 if not ray.is_initialized():
-    ray_address = os.getenv("RAY_ADDRESS", "ray://ray-ku-junyoung-head-0.ray-ku-junyoung-head.p-ncai-wbl.svc.cluster.local:10001")
-    namespace = os.getenv("RAY_NAMESPACE", "serve")
-
-    if ray_address:
-        print(f"Connecting to Ray cluster at: {ray_address}")
-
-        # Ray Client 모드를 명시적으로 비활성화
-        os.environ["RAY_CLIENT_MODE"] = "0"
-        os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
-
-        try:
-            # Worker 모드로 직접 연결
-            ray.init(
-                address=ray_address,  # 직접 주소 지정
-                namespace=namespace,
-                ignore_reinit_error=True,
-                log_to_driver=True,
-                configure_logging=True,
-            )
-            print("✓ Successfully connected to Ray cluster as worker")
-        except Exception as e:
-            print(f"Worker connection failed: {e}")
-            print("Trying with minimal configuration...")
-            try:
-                # 최소 설정으로 재시도
-                ray.init(
-                    address=ray_address,
-                    ignore_reinit_error=True,
-                )
-                print("✓ Connected with minimal config")
-            except Exception as e2:
-                print(f"All connection attempts failed: {e2}")
-                print("Starting local Ray instance as fallback...")
-                ray.init(ignore_reinit_error=True)
-    else:
-        print("RAY_ADDRESS not set, using local Ray instance")
-        ray.init(ignore_reinit_error=True)
+    ray.init(
+        address="auto",
+        namespace="serve",
+        ignore_reinit_error=True,
+        log_to_driver=True,
+    )
 
 import re
 # ① 정상 쌍 (<think> … </think>)
@@ -84,13 +46,14 @@ class VLLMRayHeadServer:
                  max_model_len: int,
                  tensor_parallel_size: int = 4,
                  pipeline_parallel_size: int = 1,
-                 gpu_memory_utilization: float = 0.90,
+                 gpu_memory_utilization: float = 0.92,
                  serving_port: int = 8000,
                  num_replicas: int = 1,
-                 max_num_seqs: int = 16,
+                 max_num_seqs: int = 96,
                  **kwargs):
-        # DeepSeek-V3.1 fp16, 16K length 기준 max_num_seqs = 96 -> 한 replica가 처리할 수 있는 seq 수
-        revision = self.get_deepseek_snapshot_revision()
+        # DeepSeek-V3.1 fp16, 16K length 기준 max_num_seqs = 96
+        max_num_seqs = max_num_seqs * num_replicas
+        revision = self.get_qwen3_snapshot_revision()
         vllm_engine_args = {
             "tensor_parallel_size": tensor_parallel_size,
             "pipeline_parallel_size": pipeline_parallel_size,
@@ -100,6 +63,7 @@ class VLLMRayHeadServer:
             "download_dir": "/data/data_team/cache/huggingface",
             "revision": revision,
             "tokenizer_revision": revision,
+            # "reasoning_parser": "deepseek_r1",
             **kwargs,
         }
         # if "qwen3" in model_name.lower():
@@ -112,17 +76,22 @@ class VLLMRayHeadServer:
                 tokenizer_source=model_name,
             ),
             deployment_config={
-                "name": "LLMServing",
-                # "num_replicas": num_replicas,
                 "autoscaling_config": {
-                    "min_replicas": int(num_replicas),
-                    "max_replicas": int(num_replicas),
-                },
-                "ray_actor_options": {
-                    "num_gpus": 0,
+                    "min_replicas": num_replicas,
+                    "max_replicas": num_replicas,  # Data Parallelism임 -> 처리 속도 관점
+                    "ray_actor_options": {
+                        "num_gpus": tensor_parallel_size * pipeline_parallel_size,
+                    }
                 }
             },
             runtime_env={
+                "pip": [
+                    "pyarrow==21.0.0",
+                    "pandas==2.3.2",
+                    "lz4",
+                    "jsonlines",
+                    "fsspec"
+                ],
                 "env_vars": {
                     # HF 캐시
                     "HF_HOME": "/data/data_team/cache/huggingface",
@@ -131,13 +100,7 @@ class VLLMRayHeadServer:
                     "HF_DATASETS_CACHE": "/data/data_team/cache/huggingface/datasets",
                     "VLLM_DOWNLOAD_DIR": "/data/data_team/cache/huggingface",
                     "HF_HUB_ENABLE_HF_TRANSFER": "1",
-                    # RDMA / NCCL 안정성
-                    "RDMAV_FORK_SAFE": "1",
-                    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-                    # IB/RDMA 최적화 (기존 head/worker와 호환)
-                    "NCCL_IB_DISABLE": "0",
-                    "NCCL_NET_GDR_LEVEL": "2",
-                    # 통신 안정성
+                    # 통신 관련
                     "NCCL_SOCKET_IFNAME": "eth0",
                     "GLOO_SOCKET_IFNAME": "eth0",
                     "NCCL_SOCKET_FAMILY": "AF_INET",
@@ -151,52 +114,41 @@ class VLLMRayHeadServer:
                     "VLLM_USE_V1": "1",
                     "TF_ENABLE_ONEDNN_OPTS": "0",
                     "NUMEXPR_MAX_THREADS": "64",
-                    "NO_PROXY": "localhost,127.0.0.1,.svc,.cluster.local",
                 }
             },
             accelerator_type="H100",
             engine_kwargs=vllm_engine_args,
         )
-        print("### v3_config")
-        print(v3_config)
-        print("### num_replicas")
-        print(num_replicas)
+        
         llm_app = build_openai_app(
             {"llm_configs": [v3_config]}
         )
-        try:
-            serve.status()
-            print("✓ Serve already started. Attaching to existing serve.")
-        except Exception:
-            print("✓ Serve not started. Starting new serve.")
-            serve.start(
-                detached=True,
-                http_options={
-                    "host": "0.0.0.0",
-                    "port": serving_port,
-                    "proxy_location": "HeadOnly",
-                }
-            )
-        serve.run(llm_app, name="deepseek-v3.1")
+        serve.start(
+            http_options={
+                "host": "0.0.0.0",
+                "port": serving_port,
+            }
+        )
+        serve.run(llm_app)
         
-    def get_deepseek_snapshot_revision(self) -> str:
+    def get_qwen3_snapshot_revision(self) -> str:
         HF_HOME = os.environ.get("HF_HOME", "/data/data_team/cache/huggingface")
-        repo_cache = Path(HF_HOME) / "models--deepseek-ai--DeepSeek-V3.1"
+        repo_cache = Path(HF_HOME) / "models--Qwen--Qwen3-235B-A22B-Thinking-2507"
         with open(repo_cache / "refs" / "main", "r") as f:
             REVISION = f.read().strip()
         return REVISION
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="deepseek-ai/DeepSeek-V3.1")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-235B-A22B-Thinking-2507")
     parser.add_argument("--max_model_len", type=int, default=16384)
     parser.add_argument("--tensor_parallel_size", type=int, default=8)
-    parser.add_argument("--num_replicas", type=int, default=1)
+    parser.add_argument("--num_replicas", type=int, default=6)
     parser.add_argument("--serving_port", type=int, default=8000)
-    parser.add_argument("--pipeline_parallel_size", type=int, default=2)
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.90)
-    parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--max_num_seqs", type=int, default=32)
+    parser.add_argument("--pipeline_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.92)
+    parser.add_argument("--dtype", type=str, default="auto")
+    parser.add_argument("--max_num_seqs", type=int, default=120)
     args = parser.parse_args()
     
     generator = VLLMRayHeadServer(

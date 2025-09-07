@@ -1,0 +1,357 @@
+# Generate Response System Deployment
+# 파일 감지, 배치 처리, Tool Agent 지원을 포함한 통합 시스템
+
+---
+# ConfigMap for Generate Response Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: generate-response-config
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    component: config
+data:
+  # 시스템 설정
+  MODEL_NAME: "deepseek-ai/DeepSeek-V3.1"
+  SERVER_URL: "http://ray-deepseek-serve.p-ncai-wbl.svc.cluster.local:8000"
+  MAX_CONCURRENT: "48"
+  TIMEOUT_S: "300.0"
+  MAX_RETRIES: "5"
+  
+  # 디렉토리 설정
+  REQUEST_DIR: "/data/data_team/request"
+  PROCESSING_DIR: "/data/data_team/processing"
+  DONE_DIR: "/data/data_team/done"
+  
+  # 모니터링 설정
+  CHECK_INTERVAL: "30.0"
+  HEALTH_ENDPOINT: "/v1/models"
+  MAX_WAIT_TIME: "600.0"
+  
+  # 로깅 설정
+  LOG_LEVEL: "INFO"
+  
+  # 실행 스크립트
+  run_monitor.py: |
+    #!/usr/bin/env python3
+    """
+    Generate Response 모니터링 모드 실행 스크립트
+    """
+    import asyncio
+    import sys
+    import os
+    sys.path.append('/data')
+    
+    from generate.main_processor import main
+    
+    if __name__ == "__main__":
+        # 환경변수에서 설정 읽기
+        os.environ.setdefault('MODE', 'monitor')
+        asyncio.run(main())
+  
+  run_batch.py: |
+    #!/usr/bin/env python3
+    """
+    Generate Response 배치 모드 실행 스크립트
+    """
+    import asyncio
+    import sys
+    import os
+    sys.path.append('/data')
+    
+    from generate.main_processor import main
+    
+    if __name__ == "__main__":
+        # 환경변수에서 설정 읽기
+        os.environ.setdefault('MODE', 'batch')
+        asyncio.run(main())
+
+---
+# Service for Generate Response (optional, for monitoring)
+apiVersion: v1
+kind: Service
+metadata:
+  name: generate-response-service
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+spec:
+  type: ClusterIP
+  selector:
+    app: generate-response
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+
+---
+# Deployment for Generate Response Monitor Mode
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: generate-response-monitor
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    mode: monitor
+spec:
+  replicas: 1  # 로드 분산을 위해 3개로 확장
+  strategy:
+    type: RollingUpdate  # 파일 처리 중복 방지를 위한 분산 로직으로 변경
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: generate-response
+      mode: monitor
+  template:
+    metadata:
+      labels:
+        app: generate-response
+        mode: monitor
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      terminationGracePeriodSeconds: 60
+      enableServiceLinks: false
+      nodeSelector:
+        mlx.navercorp.com/zone: h100-i001v8
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 500
+        runAsGroup: 500
+        fsGroup: 500
+        fsGroupChangePolicy: "OnRootMismatch"
+      
+      volumes:
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: nlpai-storage
+      - name: config-volume
+        configMap:
+          name: generate-response-config
+          defaultMode: 0755
+      
+      containers:
+      - name: generate-response
+        image: sjysjy/ray_serving:1.015
+        imagePullPolicy: IfNotPresent
+        
+        env:
+        # 기본 설정
+        - name: MODE
+          value: "batch"
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: MODEL_NAME
+        - name: SERVER_URL
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: SERVER_URL
+        - name: MAX_CONCURRENT
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: MAX_CONCURRENT
+        - name: TIMEOUT_S
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: TIMEOUT_S
+        - name: MAX_RETRIES
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: MAX_RETRIES
+        
+        # 디렉토리 설정
+        - name: REQUEST_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: REQUEST_DIR
+        - name: PROCESSING_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: PROCESSING_DIR
+        - name: DONE_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: generate-response-config
+              key: DONE_DIR
+        
+        # OpenAI 호환성
+        - name: OPENAI_API_KEY
+          value: "EMPTY"
+        
+        # 네트워크 설정
+        - name: NO_PROXY
+          value: "localhost,127.0.0.1,.svc,.cluster.local"
+        
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+        - name: config-volume
+          mountPath: /config
+        
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          
+          echo "=== Generate Response Monitor Starting ==="
+          echo "Model: ${MODEL_NAME}"
+          echo "Server: ${SERVER_URL}"
+          echo "Max Concurrent: ${MAX_CONCURRENT}"
+          echo "Request Dir: ${REQUEST_DIR}"
+          echo "Processing Dir: ${PROCESSING_DIR}"
+          echo "Done Dir: ${DONE_DIR}"
+          
+          # 디렉토리 생성
+          mkdir -p "${REQUEST_DIR}" "${PROCESSING_DIR}" "${DONE_DIR}"
+          
+          # 메인 프로세서 실행
+          cd /opt/WBL/DATA
+          python3 -m generate.main_processor \
+            --mode=monitor \
+            --server-url="${SERVER_URL}" \
+            --model-name="${MODEL_NAME}" \
+            --max-concurrent="${MAX_CONCURRENT}" \
+            --timeout="${TIMEOUT_S}" \
+            --max-retries="${MAX_RETRIES}" \
+            --request-dir="${REQUEST_DIR}" \
+            --processing-dir="${PROCESSING_DIR}" \
+            --done-dir="${DONE_DIR}"
+        
+        # 헬스체크 (선택사항)
+        livenessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              # 프로세스가 실행 중인지 확인
+              pgrep -f "generate.main_processor" > /dev/null
+          initialDelaySeconds: 30
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              # 디렉토리가 존재하는지 확인
+              test -d "${REQUEST_DIR}" && test -d "${PROCESSING_DIR}" && test -d "${DONE_DIR}"
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        resources:
+          requests:
+            cpu: "8"
+            memory: "128Gi"
+          limits:
+            cpu: "8"
+            memory: "128Gi"
+
+---
+# CronJob for Batch Processing (선택사항)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: generate-response-batch
+  namespace: p-ncai-wbl
+  labels:
+    app: generate-response
+    mode: batch
+spec:
+  schedule: "*/10 * * * *"  # 10분마다 실행
+  concurrencyPolicy: Forbid  # 동시 실행 방지
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: generate-response
+            mode: batch
+        spec:
+          restartPolicy: OnFailure
+          terminationGracePeriodSeconds: 300
+          
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 500
+            runAsGroup: 500
+            fsGroup: 500
+          
+          volumes:
+          - name: data-volume
+            persistentVolumeClaim:
+              claimName: nlpai-storage
+          - name: config-volume
+            configMap:
+              name: generate-response-config
+          
+          containers:
+          - name: generate-response-batch
+            image: sjysjy/ray_serving:1.015
+            imagePullPolicy: IfNotPresent
+            
+            envFrom:
+            - configMapRef:
+                name: generate-response-config
+            
+            env:
+            - name: MODE
+              value: "batch"
+            - name: OPENAI_API_KEY
+              value: "EMPTY"
+            
+            volumeMounts:
+            - name: data-volume
+              mountPath: /data
+            - name: config-volume
+              mountPath: /config
+            
+            command: ["/bin/bash", "-lc"]
+            args:
+            - |
+              set -euo pipefail
+              
+              echo "=== Generate Response Batch Starting ==="
+              
+              # 디렉토리 생성
+              mkdir -p "${REQUEST_DIR}" "${PROCESSING_DIR}" "${DONE_DIR}"
+              
+              # 배치 처리 실행
+              cd /opt/WBL/DATA
+              python3 -m generate.main_processor \
+                --mode=batch \
+                --server-url="${SERVER_URL}" \
+                --model-name="${MODEL_NAME}" \
+                --max-concurrent="${MAX_CONCURRENT}" \
+                --timeout="${TIMEOUT_S}" \
+                --max-retries="${MAX_RETRIES}" \
+                --request-dir="${REQUEST_DIR}" \
+                --processing-dir="${PROCESSING_DIR}" \
+                --done-dir="${DONE_DIR}"
+            
+            resources:
+              requests:
+                cpu: "8"
+                memory: "128Gi"
+              limits:
+                cpu: "8"
+                memory: "128Gi"

@@ -1,0 +1,233 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ray-ku-junyoung-head
+  namespace: p-ncai-wbl
+spec:
+  serviceName: ray-ku-junyoung-head
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ray-ku-junyoung-head
+      ray-cluster: ray-ku-junyoung
+  template:
+    metadata:
+      labels:
+        app: ray-ku-junyoung-head
+        ray-cluster: ray-ku-junyoung
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      terminationGracePeriodSeconds: 120
+      enableServiceLinks: false
+      dnsConfig:
+        options:
+        - name: ndots
+          value: "1"
+        - name: single-request-reopen
+
+      nodeSelector:
+        mlx.navercorp.com/zone: h100-i001v8
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 500
+        runAsGroup: 500
+        fsGroup: 500
+        fsGroupChangePolicy: "OnRootMismatch"
+
+        sysctls:
+        - name: net.ipv4.tcp_keepalive_time
+          value: "60"
+        - name: net.ipv4.tcp_keepalive_intvl
+          value: "30"
+        - name: net.ipv4.tcp_keepalive_probes
+          value: "4"
+
+      volumes:
+      - name: nlpai-data
+        persistentVolumeClaim:
+          claimName: nlpai-storage
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
+
+      containers:
+      - name: ray-ku-junyoung-head
+        image: sjysjy/ray_serving:1.015
+        imagePullPolicy: IfNotPresent
+
+        env:
+        - name: MY_POD_IP
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }
+
+        # --- RDMA/IB 최적화 (NCCL over ibverbs) ---
+        - { name: NCCL_IB_DISABLE, value: "0" }           # RDMA 사용
+        - { name: NCCL_NET_GDR_LEVEL, value: "2" }        # GPUDirect RDMA 선호(가능 시)
+        # 사용 HCA를 한정하려면 주석 해제 후 실제 이름으로 지정(예: mlx5_0,mlx5_1)
+        # - { name: NCCL_IB_HCA, value: "mlx5_0,mlx5_1" }
+        # RoCE 환경이면 GID index 조정이 필요할 수 있음(IB 순수환경이면 보통 불필요)
+        # - { name: NCCL_IB_GID_INDEX, value: "3" }
+        # 고대역 NIC 환경에서 QP 수 조정(필요시만)
+        # - { name: NCCL_IB_QPS_PER_CONNECTION, value: "4" }
+
+        # --- 통신/로그 ---
+        - { name: NCCL_SOCKET_IFNAME, value: "eth0" }     # TCP fallback용
+        - { name: NCCL_SOCKET_FAMILY, value: "AF_INET" }
+        - { name: NCCL_DEBUG,          value: "INFO" }
+        - { name: NCCL_DEBUG_SUBSYS,   value: "INIT,NET" }
+        - { name: GLOO_SOCKET_IFNAME,  value: "eth0" }
+        - { name: GLOO_USE_IPV6,       value: "0" }
+        - { name: TP_USE_IPV6,         value: "0" }
+        - { name: GLOO_USE_LIBUV,      value: "0" }
+        - { name: TORCH_NCCL_BLOCKING_WAIT, value: "1" }
+        - { name: NCCL_ASYNC_ERROR_HANDLING, value: "1" }
+        - { name: NO_PROXY, value: "localhost,127.0.0.1,.svc,.cluster.local" }
+
+        # ---- HF 캐시(공용 PVC) ----
+        - { name: HF_HOME,             value: "/data/data_team/cache/huggingface" }
+        - { name: HF_HUB_CACHE,        value: "/data/data_team/cache/huggingface" }
+        - { name: TRANSFORMERS_CACHE,  value: "/data/data_team/cache/huggingface/transformers" }
+        - { name: HF_DATASETS_CACHE,   value: "/data/data_team/cache/huggingface/datasets" }
+        - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+        - { name: VLLM_DOWNLOAD_DIR,   value: "/data/data_team/cache/huggingface" }
+
+        - { name: VLLM_USE_V1,         value: "1" }
+        - { name: RAY_BACKEND_LOG_LEVEL, value: "debug" }
+        - { name: RAY_VERBOSE, value: "1" }
+        - { name: RAY_NAMESPACE, value: "serve" }
+        - { name: RAY_CLIENT_RECONNECT_GRACE_PERIOD_S, value: "600" }
+        - { name: RAY_CLIENT_SERVER_KEEPALIVE_TIMEOUT_S, value: "120" }
+
+        # 무거운 모델 환경 안정성 설정
+        - { name: RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE, value: "1" }
+        - { name: RAY_ENABLE_RECORD_TASK_EVENTS, value: "1" }
+        - { name: RAY_DEDUP_LOGS, value: "0" }
+        - { name: RAY_DISABLE_IMPORT_WARNING, value: "1" }
+        - { name: PYTHONUNBUFFERED, value: "1" }
+        - { name: MALLOC_TRIM_THRESHOLD_, value: "0" }
+        # PG 교착 기본 방어
+        - { name: RAY_PLACEMENT_GROUP_CAPTURE_CHILD_TASKS, value: "0" }
+
+        volumeMounts:
+        - { name: nlpai-data, mountPath: /data }
+        - { name: dshm,      mountPath: /dev/shm }
+
+        securityContext:
+          capabilities:
+            add: ["IPC_LOCK"]
+
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -e
+          echo "=== RDMA autodetect ==="
+          if compgen -G "/dev/infiniband/uverbs*" > /dev/null; then
+            echo "✓ RDMA devices found: $(ls /dev/infiniband)"
+            export NCCL_IB_DISABLE=0
+          else
+            echo "! No RDMA devices; falling back to TCP"
+            export NCCL_IB_DISABLE=1
+          fi
+
+          ulimit -n 1048576 || true
+
+          # ⬇️ 내부 포트들을 고정해 통신/방화벽/충돌 이슈 최소화
+          ray start --head \
+            --node-ip-address=${MY_POD_IP} \
+            --port=6379 \
+            --dashboard-host=0.0.0.0 \
+            --dashboard-port=8265 \
+            --ray-client-server-port=10001 \
+            --object-manager-port=8076 \
+            --node-manager-port=8077 \
+            --min-worker-port=30000 \
+            --max-worker-port=30200 \
+            --num-gpus=0 \
+            --block
+        
+        ports:
+        - { containerPort: 6379,  name: gcs }
+        - { containerPort: 8265,  name: dashboard }
+        - { containerPort: 10001, name: client }
+        # ⬇️ 고정한 내부 포트도 명시(네트워크 정책/가시성에 도움)
+        - { containerPort: 8076,  name: objmgr }
+        - { containerPort: 8077,  name: nodemgr }
+
+        # 무거운 모델 환경 고려한 안정성 우선 프로브
+        readinessProbe:
+          httpGet:
+            path: /api/cluster_status
+            port: 8265
+            httpHeaders:
+            - name: User-Agent
+              value: "k8s-head-readiness"
+          initialDelaySeconds: 60      # 1분 초기화
+          periodSeconds: 20            # 20초 간격
+          timeoutSeconds: 10           # 10초 타임아웃
+          failureThreshold: 5          # 5번 실패 후 not ready
+          successThreshold: 2          # 2번 성공 후 ready
+
+        livenessProbe:
+          httpGet:
+            path: /api/cluster_status
+            port: 8265
+            httpHeaders:
+            - name: User-Agent
+              value: "k8s-head-liveness"
+          initialDelaySeconds: 180     # 3분 후 시작
+          periodSeconds: 30            # 30초 간격
+          timeoutSeconds: 15           # 15초 타임아웃
+          failureThreshold: 10         # 10번 실패 후 재시작 (5분)
+
+        startupProbe:
+          httpGet:
+            path: /api/cluster_status
+            port: 8265
+            httpHeaders:
+            - name: User-Agent
+              value: "k8s-head-startup"
+          initialDelaySeconds: 30
+          periodSeconds: 15            # 15초 간격
+          timeoutSeconds: 10
+          failureThreshold: 40         # 최대 10분 허용 (40*15s)
+
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/bash", "-lc", "ray stop || true"]
+
+        resources:
+          # 무거운 모델 환경 고려한 리소스 할당
+          limits:
+            cpu: "16"
+            memory: "512Gi"
+            rdma/hca_shared_devices_a: "1"   # RDMA 디바이스
+          requests:
+            cpu: "12"                        # 최소 보장
+            memory: "384Gi"                  # 최소 보장
+            rdma/hca_shared_devices_a: "1"
+
+---
+# headless service (제어면 전용)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-ku-junyoung-head
+  namespace: p-ncai-wbl
+  labels:
+    app: ray-ku-junyoung-head
+    ray-cluster: ray-ku-junyoung
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [ IPv4 ]
+  selector:
+    app: ray-ku-junyoung-head
+    ray-cluster: ray-ku-junyoung
+  ports:
+  - { name: gcs,      port: 6379,  targetPort: 6379 }
+  - { name: dashboard,port: 8265,  targetPort: 8265 }
+  - { name: client,   port: 10001, targetPort: 10001 }
